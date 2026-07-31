@@ -21,14 +21,13 @@ kitty 분할 패널에 상주하는 읽기 전용 모니터 (Python + Textual). 
 ## 개발 환경
 
 ```sh
-cd whiskers
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
 ## 실행
 
-kitty 에서 `cmd+m` 으로 현재 탭에 토글한다 (`../kitty/whiskers.conf` 를
+kitty 에서 `cmd+m` 으로 현재 탭에 토글한다 (`kitty/whiskers.conf` 를
 `~/.config/kitty/kitty.conf` 에서 include 해야 활성화됨).
 
 ## 구조
@@ -50,4 +49,4 @@ collector 단독 점검:
 .venv/bin/python -m whiskers.collector
 ```
 
-진행 상황은 `../.harness/whiskers/checklist.md` 참조 (전역 gitignore 대상).
+진행 상황은 `.harness/whiskers/checklist.md` 참조 (전역 gitignore 대상).

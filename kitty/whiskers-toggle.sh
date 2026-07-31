@@ -10,7 +10,7 @@
 # 그래서 focused -> active -> 첫 번째 순으로 폴백해 항상 한 탭을 특정한다.
 set -uo pipefail
 
-MONITOR_DIR="/Users/junho/dotfiles/whiskers"
+MONITOR_DIR="/Users/junho/whiskers"
 
 if [ -n "${KITTY_LISTEN_ON:-}" ]; then
     SOCKET="$KITTY_LISTEN_ON"
