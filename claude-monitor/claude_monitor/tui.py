@@ -7,6 +7,7 @@ collector.Collector를 주기적으로 폴링해 렌더링하는 화면. 대화 
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from rich.markup import escape
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
@@ -56,6 +57,34 @@ _MEMORY_TYPE_COLOR = {
 
 MAX_VIEW_CHARS = 60_000
 
+# 규약·메모리 파일 앞머리의 YAML 프론트매터를 본문과 분리해 헤더로 정리한다
+# (원문 그대로 두면 `---` 구분선 + 키:값이 본문에 섞여 읽기 나쁘다).
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<meta>.*?)\n---\s*\n?", re.DOTALL)
+_META_KEY_RE = re.compile(r"^(?P<key>[A-Za-z_][\w-]*):\s*(?P<value>.*)$")
+_META_VALUE_MAX_CHARS = 70
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """(프론트매터 키/값, 본문)으로 나눈다. 프론트매터가 없으면 ({}, 원문)."""
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+
+    meta: dict[str, str] = {}
+    current_key: str | None = None
+    for line in match.group("meta").splitlines():
+        if not line.strip():
+            continue
+        key_match = _META_KEY_RE.match(line)
+        if key_match and not line[0].isspace():
+            current_key = key_match.group("key")
+            meta[current_key] = key_match.group("value").strip()
+        elif current_key:  # 중첩 키나 리스트 항목 — 앞 키에 이어 붙인다
+            extra = line.strip().lstrip("-").strip().strip('"')
+            if extra:
+                meta[current_key] = f"{meta[current_key]}, {extra}".strip(", ")
+    return meta, text[match.end() :]
+
 
 class FileListItem(ListItem):
     """클릭하면 내용을 열 수 있는 목록 항목. path가 없으면(섹션 헤더 등) 열지 않는다."""
@@ -71,21 +100,38 @@ class FileViewModal(ModalScreen[None]):
     CSS = """
     FileViewModal {
         align: center middle;
-        background: $background 60%;
+        background: $background 70%;
     }
     #file-view-box {
-        width: 90%;
-        height: 85%;
+        width: 96%;
+        height: 92%;
         border: round $accent;
-        background: $panel;
+        background: $surface;
         border-title-color: $text;
-        border-title-background: $primary-darken-1;
+        border-title-background: $accent-darken-2;
         border-title-style: bold;
-        padding: 1 2;
+        border-subtitle-color: $text-muted;
+        padding: 0;
     }
-    #file-view-hint {
+    #file-view-head {
+        background: $panel;
+        padding: 1 2;
+        border-bottom: solid $accent-darken-2;
+    }
+    #file-view-title {
+        text-style: bold;
+        color: $text;
+    }
+    #file-view-desc {
+        color: $text;
+        padding-top: 1;
+    }
+    #file-view-meta {
         color: $text-muted;
-        padding-bottom: 1;
+        padding-top: 1;
+    }
+    #file-view-body {
+        padding: 1 2;
     }
     """
 
@@ -96,11 +142,33 @@ class FileViewModal(ModalScreen[None]):
         self._path = Path(path)
 
     def compose(self) -> ComposeResult:
+        raw = self._read_text()
+        meta, body = _parse_frontmatter(raw)
+
         box = VerticalScroll(id="file-view-box")
         box.border_title = self._path.name
+        box.border_subtitle = "esc · q 로 닫기"
+
         with box:
-            yield Static("esc / q 로 닫기", id="file-view-hint")
-            yield Markdown(self._read_text())
+            with Vertical(id="file-view-head"):
+                yield Label(escape(meta.get("name") or self._path.stem), id="file-view-title")
+                if meta.get("description"):
+                    yield Label(escape(meta["description"]), id="file-view-desc")
+                if meta_line := self._format_meta(meta):
+                    yield Label(meta_line, id="file-view-meta")
+            yield Markdown(body.strip(), id="file-view-body")
+
+    @staticmethod
+    def _format_meta(meta: dict[str, str]) -> str:
+        """name·description 외 나머지 프론트매터를 한 줄 요약으로."""
+        parts = []
+        for key, value in meta.items():
+            if key in {"name", "description"} or not value:
+                continue
+            if len(value) > _META_VALUE_MAX_CHARS:
+                value = value[:_META_VALUE_MAX_CHARS] + "…"
+            parts.append(f"[dim]{escape(key)}[/dim] {escape(value)}")
+        return "  ·  ".join(parts)
 
     def _read_text(self) -> str:
         try:
