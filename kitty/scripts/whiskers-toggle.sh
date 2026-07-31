@@ -10,7 +10,10 @@
 # 그래서 focused -> active -> 첫 번째 순으로 폴백해 항상 한 탭을 특정한다.
 set -uo pipefail
 
-MONITOR_DIR="/Users/junho/whiskers"
+# 레포 위치를 하드코딩하지 않는다 — 이 스크립트는 ~/.config/kitty/scripts/ 로
+# symlink 되므로, 링크를 따라간 실제 위치(<repo>/kitty/scripts/)의 두 단계 위가 레포 루트다.
+SELF=$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")" && pwd)
+MONITOR_DIR=$(cd "$SELF/../.." && pwd)
 
 if [ -n "${KITTY_LISTEN_ON:-}" ]; then
     SOCKET="$KITTY_LISTEN_ON"
