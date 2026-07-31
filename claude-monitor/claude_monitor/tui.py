@@ -136,11 +136,14 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return meta, text[match.end() :]
 
 
+CLICKABLE_CLASS = "clickable"  # 호버 반응은 이 클래스가 붙은 항목에만 준다
+
+
 class FileListItem(ListItem):
     """클릭하면 내용을 열 수 있는 목록 항목. path가 없으면(섹션 헤더 등) 열지 않는다."""
 
     def __init__(self, renderable: Label, path: str | None = None) -> None:
-        super().__init__(renderable)
+        super().__init__(renderable, classes=CLICKABLE_CLASS if path else None)
         self.file_path = path
 
 
@@ -270,7 +273,7 @@ class MessageListItem(ListItem):
     """대화 한 건. 미리보기만 보여주고, 클릭하면 전문을 모달로 연다."""
 
     def __init__(self, renderable: Label, message: ChatMessage) -> None:
-        super().__init__(renderable)
+        super().__init__(renderable, classes=CLICKABLE_CLASS)
         self.message = message
 
 
@@ -427,7 +430,7 @@ class HookBlockListItem(ListItem):
     """훅 차단 한 건. 클릭하면 전체 사유를 모달로 연다."""
 
     def __init__(self, renderable: Label, block: HookBlock) -> None:
-        super().__init__(renderable)
+        super().__init__(renderable, classes=CLICKABLE_CLASS)
         self.block = block
 
 
@@ -473,7 +476,10 @@ class SessionListItem(ListItem):
     """세션 목록 한 줄. 클릭하면 그 세션의 kitty 창으로 이동한다."""
 
     def __init__(self, renderable: Label, summary: SessionSummary) -> None:
-        super().__init__(renderable)
+        # 이동할 창을 모르는 세션(훅이 창 정보를 못 남긴 경우)은 클릭해도 할 일이 없다
+        super().__init__(
+            renderable, classes=CLICKABLE_CLASS if summary.kitty_window_id else None
+        )
         self.summary = summary
 
 
@@ -607,11 +613,31 @@ class ClaudeMonitorApp(App):
     ListView > ListItem.--highlight {
         background: $primary 25%;
     }
-    /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다 */
+    /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다.
+       왼쪽 1칸은 호버 시 나타나는 강조 띠 자리 — 평상시엔 투명해서 글자가 밀리지 않는다. */
     #chat-list > MessageListItem,
     #session-list > SessionListItem,
     #hook-list > HookBlockListItem {
         padding: 0 1 1 1;
+    }
+
+    /* 호버 반응은 .clickable 이 붙은 항목에만 — 섹션 헤더나 이동할 창을 모르는 세션은
+       반응하지 않아야 "눌러도 된다"는 신호가 거짓이 되지 않는다. */
+    ListItem.clickable {
+        border-left: blank;
+        transition: background 160ms in_out_cubic;
+    }
+    ListItem.clickable:hover {
+        background: $primary 18%;
+        border-left: thick $primary;
+    }
+    /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
+    SessionListItem.clickable:hover {
+        background: $accent 22%;
+        border-left: thick $accent;
+    }
+    FileListItem.clickable:hover {
+        border-left: thick $secondary;
     }
     Header {
         background: $panel;
