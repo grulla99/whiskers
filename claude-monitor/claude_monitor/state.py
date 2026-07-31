@@ -80,6 +80,19 @@ class SessionInfo:
 
 
 @dataclass
+class SessionSummary:
+    """세션 목록 한 줄. 훅이 남긴 상태 + transcript 의 자동 제목을 합친 것."""
+
+    session_id: str
+    title: str  # ai-title(Claude 자동 생성) 또는 사용자 지정 이름
+    state: str  # running | waiting | idle | done | unknown
+    updated_at: float
+    cwd: str = ""
+    kitty_window_id: str | None = None
+    is_current: bool = False
+
+
+@dataclass
 class Snapshot:
     """collector.build_snapshot()의 반환 타입 — UI가 폴링해서 읽는 단일 진입점."""
 
@@ -89,4 +102,5 @@ class Snapshot:
     memory_entries: list[MemoryEntry] = field(default_factory=list)
     checklists: list[ChecklistState] = field(default_factory=list)
     messages: list[ChatMessage] = field(default_factory=list)
+    sessions: list[SessionSummary] = field(default_factory=list)
     generated_at: float = 0.0

@@ -17,34 +17,60 @@ import sys
 import time
 from pathlib import Path
 
-from claude_monitor.sources import harness_watch, memory_watch, session_names
+from claude_monitor.sources import (
+    harness_watch,
+    kitty_link,
+    memory_watch,
+    session_list,
+    session_names,
+)
 from claude_monitor.sources.transcript import TranscriptTailer
 from claude_monitor.state import Snapshot, SessionInfo
 
 PROJECTS_ROOT = Path("~/.claude/projects").expanduser()
 
 
-def find_active_session() -> SessionInfo | None:
-    """`~/.claude/projects/**/*.jsonl` 중 가장 최근에 수정된 것을 활성 세션으로 본다."""
-    candidates = sorted(
-        PROJECTS_ROOT.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    if not candidates:
-        return None
-    latest = candidates[0]
-
-    cwd = ""
-    with latest.open("r", encoding="utf-8") as f:
+def _first_cwd(transcript: Path) -> str:
+    with transcript.open("r", encoding="utf-8") as f:
         for line in f:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if record.get("cwd"):
-                cwd = record["cwd"]
-                break
+                return record["cwd"]
+    return ""
 
-    return SessionInfo(session_id=latest.stem, transcript_path=str(latest), cwd=cwd)
+
+def _session_info(transcript: Path) -> SessionInfo:
+    return SessionInfo(
+        session_id=transcript.stem,
+        transcript_path=str(transcript),
+        cwd=_first_cwd(transcript),
+    )
+
+
+def transcript_for_session(session_id: str) -> Path | None:
+    return next(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"), None)
+
+
+def find_active_session() -> SessionInfo | None:
+    """모니터가 떠 있는 kitty 탭의 세션을 쓴다.
+
+    훅(hooks/session-tag.sh)이 창에 심어둔 세션 ID 가 1순위 — 이게 있으면 여러 세션을
+    동시에 띄워놔도 "이 탭의 세션"을 정확히 본다. 훅 미등록·kitty 밖 실행 등으로 못 찾으면
+    가장 최근에 수정된 transcript 로 폴백한다(정확하지 않을 수 있음).
+    """
+    session_id = kitty_link.session_id_for_current_window()
+    if session_id:
+        transcript = transcript_for_session(session_id)
+        if transcript is not None:
+            return _session_info(transcript)
+
+    candidates = sorted(
+        PROJECTS_ROOT.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return _session_info(candidates[0]) if candidates else None
 
 
 class Collector:
@@ -75,6 +101,11 @@ class Collector:
 
         try:
             snap.memory_entries = memory_watch.read_memory_entries()
+        except Exception:
+            pass
+
+        try:
+            snap.sessions = session_list.read_sessions(self.session.session_id)
         except Exception:
             pass
 

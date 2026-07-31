@@ -31,9 +31,9 @@ from textual.widgets import (
 )
 
 from claude_monitor.collector import Collector, find_active_session
-from claude_monitor.sources import session_names
+from claude_monitor.sources import kitty_link, session_names
 from claude_monitor.state import AgentStatus, ChatMessage, HarnessFile, MemoryEntry
-from claude_monitor.state import AgentEvent, ChecklistState, SessionInfo
+from claude_monitor.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
 
 KITTY_TAB_TITLE_TIMEOUT_SECONDS = 2
 
@@ -345,6 +345,53 @@ class HarnessMemoryPanel(VerticalScroll):
             )
 
 
+_SESSION_STATE_STYLE = {
+    "running": ("●", "$warning", "작업중"),
+    "waiting": ("◆", "$success", "대기"),
+    "idle": ("○", "$text-muted", "유휴"),
+    "unknown": ("·", "$text-muted", "?"),
+}
+
+
+class SessionListItem(ListItem):
+    """세션 목록 한 줄. 클릭하면 그 세션의 kitty 창으로 이동한다."""
+
+    def __init__(self, renderable: Label, summary: SessionSummary) -> None:
+        super().__init__(renderable)
+        self.summary = summary
+
+
+class SessionPanel(VerticalScroll):
+    BORDER_TITLE = "세션 (클릭하면 이동)"
+
+    def compose(self) -> ComposeResult:
+        yield ListView(id="session-list")
+
+    async def render_sessions(self, sessions: list[SessionSummary]) -> None:
+        listview = self.query_one(ListView)
+        await listview.clear()
+        if not sessions:
+            await listview.append(
+                ListItem(Label("[dim]세션 정보 없음 — 훅 등록 후 다음 턴부터 표시[/dim]"))
+            )
+            return
+
+        for summary in sessions:
+            mark, color, label = _SESSION_STATE_STYLE.get(
+                summary.state, _SESSION_STATE_STYLE["unknown"]
+            )
+            here = " [dim]← 여기[/dim]" if summary.is_current else ""
+            await listview.append(
+                SessionListItem(
+                    Label(
+                        f"[{color}]{mark}[/{color}] {escape(summary.title)}{here}\n"
+                        f"   [dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+                    ),
+                    summary=summary,
+                )
+            )
+
+
 class ChecklistPanel(VerticalScroll):
     BORDER_TITLE = "Checklist"
 
@@ -407,14 +454,14 @@ class ClaudeMonitorApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 2 2;
+        grid-size: 2 3;
         grid-gutter: 1 1;
-        grid-rows: 1fr 1fr;
+        grid-rows: 1fr 1fr 1fr;
         grid-columns: 1fr 1fr;
         padding: 0 1 0 1;
         background: $background;
     }
-    ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel {
+    ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel, SessionPanel {
         border: round $primary 40%;
         background: $surface;
         padding: 0;
@@ -424,7 +471,8 @@ class ClaudeMonitorApp(App):
         scrollbar-size-vertical: 1;
     }
     ChatPanel:focus-within, AgentPanel:focus-within,
-    HarnessMemoryPanel:focus-within, ChecklistPanel:focus-within {
+    HarnessMemoryPanel:focus-within, ChecklistPanel:focus-within,
+    SessionPanel:focus-within {
         border: round $accent;
         border-title-color: $accent;
     }
@@ -443,8 +491,9 @@ class ClaudeMonitorApp(App):
     ListView > ListItem.--highlight {
         background: $primary 25%;
     }
-    /* 대화 카드는 한 건이 2줄+헤더라 아래 여백을 줘야 서로 붙어 보이지 않는다 */
-    #chat-list > MessageListItem {
+    /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다 */
+    #chat-list > MessageListItem,
+    #session-list > SessionListItem {
         padding: 0 1 1 1;
     }
     Header {
@@ -468,6 +517,7 @@ class ClaudeMonitorApp(App):
         self._last_harness_files: list[HarnessFile] | None = None
         self._last_memory_entries: list[MemoryEntry] | None = None
         self._last_checklists: list[ChecklistState] | None = None
+        self._last_sessions: list[SessionSummary] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -475,6 +525,7 @@ class ClaudeMonitorApp(App):
         yield AgentPanel(id="panel-agent")
         yield HarnessMemoryPanel(id="panel-harness-memory")
         yield ChecklistPanel(id="panel-checklist")
+        yield SessionPanel(id="panel-session")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -493,6 +544,8 @@ class ClaudeMonitorApp(App):
             self.push_screen(FileViewModal(item.file_path))
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
+        elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
+            kitty_link.focus_window(item.summary.kitty_window_id)
 
     @work
     async def action_rename_session(self) -> None:
@@ -547,6 +600,10 @@ class ClaudeMonitorApp(App):
             if snapshot.checklists != self._last_checklists:
                 await self.query_one(ChecklistPanel).render_checklists(snapshot.checklists)
                 self._last_checklists = snapshot.checklists
+
+            if snapshot.sessions != self._last_sessions:
+                await self.query_one(SessionPanel).render_sessions(snapshot.sessions)
+                self._last_sessions = snapshot.sessions
         finally:
             self._refreshing = False
 
