@@ -372,7 +372,7 @@ class AgentPanel(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         table = DataTable(id="agent-table", cursor_type="row", zebra_stripes=True)
-        table.add_columns("상태", "타입", "모델", "토큰", "시간")
+        table.add_columns("상태", "타입", "지금/wf", "모델", "토큰", "시간")
         yield table
 
     def render_agents(self, agents: list[AgentEvent]) -> None:
@@ -380,9 +380,17 @@ class AgentPanel(VerticalScroll):
         table.clear()
         for agent in agents:
             label, style = _STATUS_STYLE.get(agent.status, (agent.status.value, "white"))
+            # 실행 중이면 지금 쓰는 도구를, 워크플로우 소속이면 그 실행 id 를 보여준다
+            if agent.current_tool:
+                context = Text(f"→ {agent.current_tool}", style="italic")
+            elif agent.workflow:
+                context = Text(agent.workflow.removeprefix("wf_")[:10], style="dim")
+            else:
+                context = Text("-", style="dim")
             table.add_row(
                 Text(label, style=style),
                 agent.subagent_type,
+                context,
                 _short_model(agent.model),
                 _short_tokens(agent.tokens),
                 _short_duration(agent.duration_ms),

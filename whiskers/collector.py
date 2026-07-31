@@ -20,6 +20,7 @@ from pathlib import Path
 from whiskers.sources import (
     harness_watch,
     kitty_link,
+    live_agents,
     memory_watch,
     session_list,
     session_names,
@@ -80,11 +81,41 @@ class Collector:
         self.session = session
         self._transcript_tailer = TranscriptTailer(session.transcript_path)
 
+    def _merge_agents(self, transcript_agents: list) -> list:
+        """실시간 상태(서브에이전트 파일) + 사후 집계(transcript)를 합친다.
+
+        - 상태·현재 도구·워크플로우: 실시간 소스가 정답 (transcript 는 완료 신호가 늦다)
+        - 모델·토큰·소요시간: 완료 후 transcript 에만 있다
+        - 훅에 막혀 아예 뜨지 못한 에이전트: 실시간 소스엔 없고 transcript 에만 있다
+        두 소스는 toolUseId(=agent_id) 로 잇는다.
+        """
+        try:
+            live = live_agents.read_live_agents(self.session.session_id)
+        except Exception:
+            return transcript_agents
+
+        if not live:
+            return transcript_agents
+
+        by_id = {agent.agent_id: agent for agent in transcript_agents}
+        merged = []
+        for agent in live:
+            counterpart = by_id.pop(agent.agent_id, None)
+            if counterpart is not None:
+                agent.model = counterpart.model
+                agent.tokens = counterpart.tokens
+                agent.duration_ms = counterpart.duration_ms
+                agent.result_summary = counterpart.result_summary
+            merged.append(agent)
+
+        merged.extend(by_id.values())  # 실시간 소스에 없는 것(훅 차단 등)도 보존
+        return merged
+
     def snapshot(self) -> Snapshot:
         self.session.display_name = session_names.get_display_name(self.session.session_id)
 
         snap = Snapshot(session=self.session, generated_at=time.time())
-        snap.agents = self._transcript_tailer.poll()
+        snap.agents = self._merge_agents(self._transcript_tailer.poll())
         snap.messages = self._transcript_tailer.recent_messages()
         snap.context = self._transcript_tailer.context_usage()
         snap.hook_blocks = self._transcript_tailer.hook_blocks()

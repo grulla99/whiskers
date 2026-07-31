@@ -28,6 +28,8 @@ class AgentEvent:
     model: str | None = None
     tokens: int | None = None
     duration_ms: int | None = None
+    current_tool: str | None = None  # 지금 이 순간 쓰고 있는 도구 (실행 중일 때만)
+    workflow: str | None = None  # 워크플로우 실행 id (wf_...), 직접 호출이면 None
 
 
 @dataclass
