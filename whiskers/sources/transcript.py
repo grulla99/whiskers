@@ -84,12 +84,28 @@ class TranscriptTailer:
         self._messages: list[ChatMessage] = []
         self._context: ContextUsage | None = None
         self._hook_blocks: list[HookBlock] = []
+        self._touched_dirs: dict[str, int] = {}  # 디렉토리 -> 마지막으로 건드린 순번
+        self._touch_seq = 0
 
     def recent_messages(self, limit: int = MAX_MESSAGES) -> list[ChatMessage]:
         return self._messages[-limit:]
 
     def hook_blocks(self) -> list[HookBlock]:
         return list(self._hook_blocks)
+
+    def touched_roots(self, limit: int = 6) -> list[str]:
+        """세션이 파일을 만지작한 디렉토리들 — **최근에 건드린 순**.
+
+        `.harness` 체크리스트를 어디서 찾을지 정하는 데 쓴다 (cwd 가 홈이어도 실제
+        작업 디렉토리를 잡아내기 위함).
+
+        횟수가 아니라 최근성으로 정렬한다 — 디렉토리 이름이 바뀌면 옛 경로가 누적
+        횟수로는 계속 1위인데 이미 존재하지도 않는다(실제로 겪은 문제). 없어진
+        디렉토리는 아예 제외한다.
+        """
+        ranked = sorted(self._touched_dirs.items(), key=lambda kv: -kv[1])
+        existing = [path for path, _ in ranked if Path(path).is_dir()]
+        return existing[:limit]
 
     def context_usage(self) -> ContextUsage | None:
         return self._context
@@ -135,12 +151,27 @@ class TranscriptTailer:
         elif record_type == "queue-operation":
             self._ingest_task_notification(record)
 
+    def _note_touched_path(self, tool_input: dict) -> None:
+        """Edit/Write 등이 다룬 파일의 상위 디렉토리를 세어둔다 (프로젝트 루트 추정용)."""
+        raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+        if not isinstance(raw, str) or not raw.startswith("/"):
+            return
+        # 파일이 깊이 있어도 프로젝트 루트를 찾도록 조상 디렉토리를 함께 센다
+        self._touch_seq += 1
+        parents = list(Path(raw).parents)[:4]
+        for parent in parents:
+            key = str(parent)
+            if key in ("/", str(Path.home().parent)):
+                continue
+            self._touched_dirs[key] = self._touch_seq  # 최근성(마지막으로 건드린 순번)
+
     def _ingest_tool_use(self, record: dict) -> None:
         content = (record.get("message") or {}).get("content") or []
         started_at = _parse_timestamp(record.get("timestamp"))
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
+            self._note_touched_path(block.get("input") or {})
             if block.get("name") not in AGENT_TOOL_NAMES:
                 continue
             tool_input = block.get("input") or {}
