@@ -25,12 +25,35 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from claude_monitor.state import AgentEvent, AgentStatus, ChatMessage
+from claude_monitor.state import AgentEvent, AgentStatus, ChatMessage, ContextUsage, HookBlock
+
+# 훅 차단은 tool_result 의 에러 문자열로 온다:
+#   "Error: PreToolUse:Agent hook error: [node ".../delegation-gate.js"]: [delegation-gate] 위임 ..."
+_HOOK_BLOCK_RE = re.compile(
+    r"(?P<event>\w+):(?P<tool>\w+)\s+hook\s+error:\s*(?:\[(?P<runner>[^\]]*)\]\s*:)?\s*(?P<reason>.*)",
+    re.DOTALL,
+)
+_HOOK_SCRIPT_RE = re.compile(r"([\w.-]+)\.(?:js|sh|ts|py)")
+_HOOK_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]")
+HOOK_REASON_MAX_CHARS = 4_000  # 목록엔 앞부분만 쓰고, 클릭 시 전문을 보여주므로 넉넉히 보관
+MAX_HOOK_BLOCKS = 30
 
 AGENT_TOOL_NAMES = {"Agent"}
 SUMMARY_MAX_CHARS = 200
 ASYNC_LAUNCH_MARKER = "Async agent launched successfully"
 MAX_MESSAGES = 50
+
+# 컨텍스트 한도는 모델명으로 단정하지 않는다 — 모델이 계속 바뀌므로 표가 낡는다.
+# `[1m]` 표기가 있으면 1M, 없으면 200k 로 보되, 관측값이 200k 를 넘으면 1M 으로 자기교정.
+STANDARD_CONTEXT_LIMIT = 200_000
+LONG_CONTEXT_LIMIT = 1_000_000
+_INPUT_TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _context_limit(model: str, observed_input_tokens: int) -> int:
+    if model and "[1m]" in model:
+        return LONG_CONTEXT_LIMIT
+    return LONG_CONTEXT_LIMIT if observed_input_tokens > STANDARD_CONTEXT_LIMIT else STANDARD_CONTEXT_LIMIT
 
 
 def _extract_tag(content: str, tag: str) -> str | None:
@@ -59,9 +82,17 @@ class TranscriptTailer:
         self._offset = 0
         self._agents: dict[str, AgentEvent] = {}
         self._messages: list[ChatMessage] = []
+        self._context: ContextUsage | None = None
+        self._hook_blocks: list[HookBlock] = []
 
     def recent_messages(self, limit: int = MAX_MESSAGES) -> list[ChatMessage]:
         return self._messages[-limit:]
+
+    def hook_blocks(self) -> list[HookBlock]:
+        return list(self._hook_blocks)
+
+    def context_usage(self) -> ContextUsage | None:
+        return self._context
 
     def poll(self) -> list[AgentEvent]:
         if not self._path.exists():
@@ -97,6 +128,7 @@ class TranscriptTailer:
         if record_type == "assistant":
             self._ingest_tool_use(record)
             self._ingest_assistant_text(record)
+            self._ingest_usage(record)
         elif record_type == "user":
             self._ingest_tool_result(record)
             self._ingest_user_text(record)
@@ -120,7 +152,35 @@ class TranscriptTailer:
                 started_at=started_at,
             )
 
+    def _ingest_hook_block(self, record: dict) -> None:
+        """훅이 도구를 막은 사건을 기록한다 (Agent 뿐 아니라 Bash 등 모든 도구 대상)."""
+        raw = record.get("toolUseResult")
+        if not isinstance(raw, str) or "hook error" not in raw:
+            return
+        match = _HOOK_BLOCK_RE.search(raw)
+        if not match:
+            return
+
+        reason = " ".join((match.group("reason") or "").split())
+        runner = match.group("runner") or ""
+        script = _HOOK_SCRIPT_RE.search(runner)
+        tag = _HOOK_TAG_RE.match(reason)
+        hook_name = script.group(1) if script else (tag.group(1) if tag else "hook")
+
+        self._hook_blocks.append(
+            HookBlock(
+                tool=match.group("tool") or "?",
+                hook_name=hook_name,
+                reason=reason[:HOOK_REASON_MAX_CHARS],
+                timestamp=_parse_timestamp(record.get("timestamp")),
+            )
+        )
+        if len(self._hook_blocks) > MAX_HOOK_BLOCKS:
+            self._hook_blocks = self._hook_blocks[-MAX_HOOK_BLOCKS:]
+
     def _ingest_tool_result(self, record: dict) -> None:
+        self._ingest_hook_block(record)
+
         content = (record.get("message") or {}).get("content") or []
         completed_at = _parse_timestamp(record.get("timestamp"))
         for block in content:
@@ -137,6 +197,30 @@ class TranscriptTailer:
             event.status = AgentStatus.FAILED if is_error else AgentStatus.COMPLETED
             event.completed_at = completed_at
             event.result_summary = self._extract_summary(record, block, is_error)
+
+            # foreground(동기) 완료는 toolUseResult 에 모델·토큰·소요시간이 함께 온다
+            tool_use_result = record.get("toolUseResult")
+            if isinstance(tool_use_result, dict):
+                event.model = tool_use_result.get("resolvedModel") or event.model
+                event.tokens = tool_use_result.get("totalTokens") or event.tokens
+                event.duration_ms = tool_use_result.get("totalDurationMs") or event.duration_ms
+
+    def _ingest_usage(self, record: dict) -> None:
+        """마지막 assistant 턴의 usage 로 컨텍스트 점유를 갱신한다."""
+        message = record.get("message") or {}
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            return
+        input_tokens = sum(int(usage.get(key) or 0) for key in _INPUT_TOKEN_KEYS)
+        if not input_tokens:
+            return
+        model = message.get("model") or ""
+        self._context = ContextUsage(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=int(usage.get("output_tokens") or 0),
+            limit=_context_limit(model, input_tokens),
+        )
 
     def _ingest_assistant_text(self, record: dict) -> None:
         content = (record.get("message") or {}).get("content") or []
@@ -186,6 +270,13 @@ class TranscriptTailer:
         event.status = AgentStatus.COMPLETED if status == "completed" else AgentStatus.FAILED
         event.completed_at = _parse_timestamp(record.get("timestamp"))
         event.result_summary = result[:SUMMARY_MAX_CHARS]
+
+        # background(비동기) 완료는 알림 안 <usage> 블록에 토큰·소요시간이 담긴다
+        # (모델명은 여기 없어서 None 으로 남는다)
+        for tag, attribute in (("subagent_tokens", "tokens"), ("duration_ms", "duration_ms")):
+            raw = _extract_tag(content, tag)
+            if raw and raw.isdigit():
+                setattr(event, attribute, int(raw))
 
     @staticmethod
     def _is_async_launch_ack(block: dict) -> bool:

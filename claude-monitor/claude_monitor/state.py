@@ -25,6 +25,33 @@ class AgentEvent:
     started_at: float
     completed_at: float | None = None
     result_summary: str | None = None
+    model: str | None = None
+    tokens: int | None = None
+    duration_ms: int | None = None
+
+
+@dataclass
+class HookBlock:
+    """하네스 훅이 도구 사용을 막은 사건 (delegation-gate, work-log 체크 등)."""
+
+    tool: str  # 막힌 도구 (Agent, Bash ...)
+    hook_name: str  # 막은 훅 (delegation-gate ...)
+    reason: str
+    timestamp: float
+
+
+@dataclass
+class ContextUsage:
+    """마지막 턴 기준 컨텍스트 점유 추정."""
+
+    model: str = ""
+    input_tokens: int = 0  # 입력계 합(신규+캐시읽기+캐시생성) = 컨텍스트 점유 추정
+    output_tokens: int = 0
+    limit: int = 0
+
+    @property
+    def ratio(self) -> float:
+        return (self.input_tokens / self.limit) if self.limit else 0.0
 
 
 @dataclass
@@ -103,4 +130,6 @@ class Snapshot:
     checklists: list[ChecklistState] = field(default_factory=list)
     messages: list[ChatMessage] = field(default_factory=list)
     sessions: list[SessionSummary] = field(default_factory=list)
+    hook_blocks: list[HookBlock] = field(default_factory=list)
+    context: ContextUsage | None = None
     generated_at: float = 0.0

@@ -1,8 +1,12 @@
-"""Textual TUI 골격 — 4패널(대화 로그 / Agent 상태 / Harness+Memory / Checklist).
+"""Textual TUI — 6패널.
 
-collector.Collector를 주기적으로 폴링해 렌더링하는 화면. 대화 패널은 지금은
-읽기 전용 tail이다 — 타이핑해서 Claude를 구동하는 입력창은 스코프 밖으로
-확정함(사용자 확인, .harness/kitty-claude-monitor/context.md 참조).
+대화 로그 / Agent 상태·비용 / Harness+Memory / Checklist / 세션 목록 / 하네스 차단.
+헤더에는 컨텍스트 사용률 게이지가 상주한다.
+
+collector.Collector를 주기적으로 폴링해 렌더링하는 화면. 전부 읽기 전용이다 —
+타이핑해서 Claude를 구동하는 입력창은 스코프 밖으로 확정함
+(사용자 확인, .harness/kitty-claude-monitor/context.md 참조).
+클릭 동작: 규약·메모리·대화·차단은 내용 모달, 세션은 그 창으로 이동.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -32,7 +37,7 @@ from textual.widgets import (
 
 from claude_monitor.collector import Collector, find_active_session
 from claude_monitor.sources import kitty_link, session_names
-from claude_monitor.state import AgentStatus, ChatMessage, HarnessFile, MemoryEntry
+from claude_monitor.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
 from claude_monitor.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
 
 KITTY_TAB_TITLE_TIMEOUT_SECONDS = 2
@@ -88,6 +93,14 @@ def _preview(text: str) -> str:
     if len(preview) > PREVIEW_MAX_CHARS:
         preview = preview[:PREVIEW_MAX_CHARS].rstrip()
     return preview or "(내용 없음)"
+
+
+GAUGE_WIDTH = 10
+
+
+def _gauge(ratio: float) -> str:
+    filled = max(0, min(GAUGE_WIDTH, round(ratio * GAUGE_WIDTH)))
+    return "█" * filled + "░" * (GAUGE_WIDTH - filled)
 
 
 def _is_truncated(text: str) -> bool:
@@ -217,6 +230,42 @@ class FileViewModal(ModalScreen[None]):
         return text
 
 
+class TextViewModal(ModalScreen[None]):
+    """제목 + 본문 텍스트를 읽기 전용으로 보여주는 범용 모달. Escape·q로 닫는다."""
+
+    CSS = """
+    TextViewModal {
+        align: center middle;
+        background: $background 70%;
+    }
+    #text-view-box {
+        width: 96%;
+        height: 92%;
+        border: round $accent;
+        background: $surface;
+        border-title-color: $text;
+        border-title-background: $accent-darken-2;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        box = VerticalScroll(id="text-view-box")
+        box.border_title = self._title
+        box.border_subtitle = "esc · q 로 닫기"
+        with box:
+            yield Label(escape(self._body))
+
+
 class MessageListItem(ListItem):
     """대화 한 건. 미리보기만 보여주고, 클릭하면 전문을 모달로 연다."""
 
@@ -292,12 +341,35 @@ class ChatPanel(VerticalScroll):
             )
 
 
+def _short_model(model: str | None) -> str:
+    if not model:
+        return "-"
+    # claude-sonnet-5 / claude-haiku-4-5-20251001 / claude-opus-4-8[1m] -> sonnet / haiku / opus
+    for tier in ("opus", "sonnet", "haiku", "fable"):
+        if tier in model:
+            return tier + (" 1m" if "[1m]" in model else "")
+    return model[:12]
+
+
+def _short_tokens(tokens: int | None) -> str:
+    if not tokens:
+        return "-"
+    return f"{tokens / 1000:.0f}k" if tokens >= 1000 else str(tokens)
+
+
+def _short_duration(duration_ms: int | None) -> str:
+    if not duration_ms:
+        return "-"
+    seconds = duration_ms / 1000
+    return f"{seconds / 60:.0f}m" if seconds >= 90 else f"{seconds:.0f}s"
+
+
 class AgentPanel(VerticalScroll):
-    BORDER_TITLE = "Agent 상태"
+    BORDER_TITLE = "Agent 상태 · 비용"
 
     def compose(self) -> ComposeResult:
         table = DataTable(id="agent-table", cursor_type="row", zebra_stripes=True)
-        table.add_columns("상태", "타입", "설명")
+        table.add_columns("상태", "타입", "모델", "토큰", "시간")
         yield table
 
     def render_agents(self, agents: list[AgentEvent]) -> None:
@@ -305,7 +377,13 @@ class AgentPanel(VerticalScroll):
         table.clear()
         for agent in agents:
             label, style = _STATUS_STYLE.get(agent.status, (agent.status.value, "white"))
-            table.add_row(Text(label, style=style), agent.subagent_type, agent.description[:40])
+            table.add_row(
+                Text(label, style=style),
+                agent.subagent_type,
+                _short_model(agent.model),
+                _short_tokens(agent.tokens),
+                _short_duration(agent.duration_ms),
+            )
 
 
 class HarnessMemoryPanel(VerticalScroll):
@@ -341,6 +419,44 @@ class HarnessMemoryPanel(VerticalScroll):
                         f"  [dim]·[/dim] [{color}]{escape(entry.memory_type)}[/{color}] {escape(entry.file)}"
                     ),
                     path=entry.path or None,
+                )
+            )
+
+
+class HookBlockListItem(ListItem):
+    """훅 차단 한 건. 클릭하면 전체 사유를 모달로 연다."""
+
+    def __init__(self, renderable: Label, block: HookBlock) -> None:
+        super().__init__(renderable)
+        self.block = block
+
+
+class HookPanel(VerticalScroll):
+    BORDER_TITLE = "하네스 차단 (클릭하면 사유)"
+
+    def compose(self) -> ComposeResult:
+        yield ListView(id="hook-list")
+
+    async def render_blocks(self, blocks: list[HookBlock]) -> None:
+        listview = self.query_one(ListView)
+        await listview.clear()
+        if not blocks:
+            await listview.append(ListItem(Label("[dim]이번 세션 훅 차단 없음[/dim]")))
+            return
+
+        counts = Counter(block.hook_name for block in blocks)
+        summary = "  ".join(f"{name} {count}" for name, count in counts.most_common())
+        await listview.append(ListItem(Label(f"[bold]총 {len(blocks)}건[/bold]  [dim]{escape(summary)}[/dim]")))
+
+        for block in reversed(blocks):  # 최신이 위
+            await listview.append(
+                HookBlockListItem(
+                    Label(
+                        f"[$error]✗[/$error] [bold]{escape(block.hook_name)}[/bold] "
+                        f"[dim]{escape(block.tool)} · {_format_time(block.timestamp)}[/dim]\n"
+                        f"   {escape(_preview(block.reason))}"
+                    ),
+                    block=block,
                 )
             )
 
@@ -461,7 +577,7 @@ class ClaudeMonitorApp(App):
         padding: 0 1 0 1;
         background: $background;
     }
-    ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel, SessionPanel {
+    ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel, SessionPanel, HookPanel {
         border: round $primary 40%;
         background: $surface;
         padding: 0;
@@ -472,7 +588,7 @@ class ClaudeMonitorApp(App):
     }
     ChatPanel:focus-within, AgentPanel:focus-within,
     HarnessMemoryPanel:focus-within, ChecklistPanel:focus-within,
-    SessionPanel:focus-within {
+    SessionPanel:focus-within, HookPanel:focus-within {
         border: round $accent;
         border-title-color: $accent;
     }
@@ -493,7 +609,8 @@ class ClaudeMonitorApp(App):
     }
     /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다 */
     #chat-list > MessageListItem,
-    #session-list > SessionListItem {
+    #session-list > SessionListItem,
+    #hook-list > HookBlockListItem {
         padding: 0 1 1 1;
     }
     Header {
@@ -518,6 +635,7 @@ class ClaudeMonitorApp(App):
         self._last_memory_entries: list[MemoryEntry] | None = None
         self._last_checklists: list[ChecklistState] | None = None
         self._last_sessions: list[SessionSummary] | None = None
+        self._last_hook_blocks: list[HookBlock] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -526,6 +644,7 @@ class ClaudeMonitorApp(App):
         yield HarnessMemoryPanel(id="panel-harness-memory")
         yield ChecklistPanel(id="panel-checklist")
         yield SessionPanel(id="panel-session")
+        yield HookPanel(id="panel-hook")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -533,10 +652,19 @@ class ClaudeMonitorApp(App):
         await self._refresh()
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
 
-    def _update_title(self) -> None:
+    def _update_title(self, context: ContextUsage | None = None) -> None:
         session = self._collector.session
         self.title = session.display_name or session.session_id
-        self.sub_title = session.cwd
+        # 컨텍스트 사용률을 헤더에 상주시킨다 — performance.md 의 "마지막 20% 회피"를
+        # 눈으로 확인할 수 있어야 지켜진다
+        if context and context.limit:
+            gauge = _gauge(context.ratio)
+            self.sub_title = (
+                f"ctx {gauge} {context.ratio:.0%} "
+                f"({context.input_tokens // 1000}k/{context.limit // 1000}k) · {session.cwd}"
+            )
+        else:
+            self.sub_title = session.cwd
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
@@ -546,6 +674,11 @@ class ClaudeMonitorApp(App):
             self.push_screen(MessageViewModal(item.message))
         elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
             kitty_link.focus_window(item.summary.kitty_window_id)
+        elif isinstance(item, HookBlockListItem):
+            block = item.block
+            self.push_screen(
+                TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
+            )
 
     @work
     async def action_rename_session(self) -> None:
@@ -577,7 +710,7 @@ class ClaudeMonitorApp(App):
         self._refreshing = True
         try:
             snapshot = self._collector.snapshot()
-            self._update_title()
+            self._update_title(snapshot.context)
 
             if snapshot.messages != self._last_messages:
                 await self.query_one(ChatPanel).render_messages(snapshot.messages)
@@ -604,6 +737,10 @@ class ClaudeMonitorApp(App):
             if snapshot.sessions != self._last_sessions:
                 await self.query_one(SessionPanel).render_sessions(snapshot.sessions)
                 self._last_sessions = snapshot.sessions
+
+            if snapshot.hook_blocks != self._last_hook_blocks:
+                await self.query_one(HookPanel).render_blocks(snapshot.hook_blocks)
+                self._last_hook_blocks = snapshot.hook_blocks
         finally:
             self._refreshing = False
 

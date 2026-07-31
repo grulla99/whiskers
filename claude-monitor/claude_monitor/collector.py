@@ -86,6 +86,8 @@ class Collector:
         snap = Snapshot(session=self.session, generated_at=time.time())
         snap.agents = self._transcript_tailer.poll()
         snap.messages = self._transcript_tailer.recent_messages()
+        snap.context = self._transcript_tailer.context_usage()
+        snap.hook_blocks = self._transcript_tailer.hook_blocks()
 
         # 소스 하나가 예상 못한 이유로 실패해도(권한 오류, 손상된 markdown 등)
         # 나머지 패널은 계속 그려야 하므로 개별적으로 격리한다.
