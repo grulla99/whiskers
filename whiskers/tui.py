@@ -33,6 +33,7 @@ from textual.widgets import (
     ListItem,
     ListView,
     Markdown,
+    Static,
 )
 
 from whiskers.collector import Collector, find_active_session
@@ -367,6 +368,22 @@ def _short_duration(duration_ms: int | None) -> str:
     return f"{seconds / 60:.0f}m" if seconds >= 90 else f"{seconds:.0f}s"
 
 
+class FilterToggle(Static):
+    """완료 항목 숨김 버튼. 키(`h`)와 같은 동작을 마우스로도 할 수 있게 한다."""
+
+    def render_state(self, hide_completed: bool) -> None:
+        self.update(
+            "[b]☑ 완료 숨김[/b]  [dim]클릭 또는 h 로 해제[/dim]"
+            if hide_completed
+            else "☐ 완료 숨기기  [dim]클릭 또는 h[/dim]"
+        )
+        self.set_class(hide_completed, "-active")
+
+    def on_click(self) -> None:
+        # action 이 async 이므로 워커로 띄운다
+        self.app.run_worker(self.app.action_toggle_completed())
+
+
 def _hidden_suffix(hidden: int) -> str:
     """숨긴 개수를 제목에 붙인다 — 데이터가 조용히 사라진 것처럼 보이면 안 된다."""
     return f"  [완료 {hidden} 숨김]" if hidden else ""
@@ -598,8 +615,10 @@ class RenameModal(ModalScreen[str | None]):
 
 
 class ClaudeMonitorApp(App):
-    # kitty 가 Catppuccin Mocha 라 앱도 같은 팔레트로 맞춘다 (따로 놀지 않게)
-    theme = "catppuccin-mocha"
+    # kitty 가 Catppuccin Mocha 라 앱도 같은 팔레트로 맞춘다 (따로 놀지 않게).
+    # 주의: App.theme 은 reactive 다. 클래스 속성으로 문자열을 넣으면 reactive 를
+    # 덮어써서 이후 테마 변경이 전혀 반영되지 않는다 — on_mount 에서 대입할 것.
+    DEFAULT_THEME = "catppuccin-mocha"
 
     CSS = """
     Screen {
@@ -673,6 +692,25 @@ class ClaudeMonitorApp(App):
     Footer {
         background: $panel;
     }
+    #bottom-bar {
+        dock: bottom;
+        height: 2;
+    }
+    /* 완료 숨김 버튼 — Footer 바로 위 1줄. 좁은 분할 패널이라 높이를 아낀다 */
+    FilterToggle {
+        height: 1;
+        padding: 0 1;
+        background: $surface;
+        color: $text-muted;
+    }
+    FilterToggle:hover {
+        background: $primary 25%;
+        color: $text;
+    }
+    FilterToggle.-active {
+        background: $accent 25%;
+        color: $text;
+    }
     """
 
     BINDINGS = [
@@ -703,9 +741,15 @@ class ClaudeMonitorApp(App):
         yield ChecklistPanel(id="panel-checklist")
         yield SessionPanel(id="panel-session")
         yield HookPanel(id="panel-hook")
-        yield Footer()
+        # 버튼과 Footer 를 같은 컨테이너에 넣는다 — 둘 다 dock:bottom 으로 두면
+        # 영역이 완전히 겹쳐 클릭이 Footer 로 먹힌다(실측으로 확인).
+        with Vertical(id="bottom-bar"):
+            yield FilterToggle(id="filter-toggle")
+            yield Footer()
 
     async def on_mount(self) -> None:
+        self.theme = self.DEFAULT_THEME
+        self.query_one(FilterToggle).render_state(self._hide_completed)
         self._update_title()
         await self._refresh()
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
@@ -740,6 +784,7 @@ class ClaudeMonitorApp(App):
 
     async def action_toggle_completed(self) -> None:
         self._hide_completed = not self._hide_completed
+        self.query_one(FilterToggle).render_state(self._hide_completed)
         # diff 캐시를 비워 다음 폴링(최대 2.5초)을 기다리지 않고 즉시 다시 그리게 한다
         self._last_agents = None
         self._last_checklists = None
