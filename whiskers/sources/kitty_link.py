@@ -1,0 +1,66 @@
+"""kitty 창 ↔ Claude 세션 연결.
+
+`find_active_session()`의 "가장 최근 mtime" 휴리스틱은 여러 세션을 왕복하면 엉뚱한
+세션을 물었다. 대신 훅(hooks/session-tag.sh)이 각 kitty 창에 `CLAUDE_SESSION_ID`
+user-var 를 심어두고, 모니터는 **자기 창과 같은 탭**에 있는 그 값을 읽어 세션을 특정한다.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+
+KITTY_TIMEOUT_SECONDS = 3
+SESSION_USER_VAR = "CLAUDE_SESSION_ID"
+
+
+def _kitty_ls() -> list[dict]:
+    try:
+        result = subprocess.run(
+            ["kitty", "@", "ls"],
+            capture_output=True,
+            text=True,
+            timeout=KITTY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def session_id_for_current_window() -> str | None:
+    """모니터가 떠 있는 탭의 Claude 세션 ID. 못 찾으면 None."""
+    own_window_id = os.environ.get("KITTY_WINDOW_ID")
+    if not own_window_id:
+        return None
+
+    for os_window in _kitty_ls():
+        for tab in os_window.get("tabs") or []:
+            windows = tab.get("windows") or []
+            if not any(str(w.get("id")) == str(own_window_id) for w in windows):
+                continue
+            # 같은 탭의 형제 창 중 세션 ID 를 들고 있는 것을 찾는다
+            for window in windows:
+                session_id = (window.get("user_vars") or {}).get(SESSION_USER_VAR)
+                if session_id:
+                    return session_id
+            return None
+    return None
+
+
+def focus_window(window_id: str | int) -> None:
+    """세션 목록에서 고른 세션의 창으로 이동한다."""
+    try:
+        subprocess.run(
+            ["kitty", "@", "focus-window", "--match", f"id:{window_id}"],
+            capture_output=True,
+            timeout=KITTY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
