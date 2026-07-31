@@ -367,6 +367,11 @@ def _short_duration(duration_ms: int | None) -> str:
     return f"{seconds / 60:.0f}m" if seconds >= 90 else f"{seconds:.0f}s"
 
 
+def _hidden_suffix(hidden: int) -> str:
+    """숨긴 개수를 제목에 붙인다 — 데이터가 조용히 사라진 것처럼 보이면 안 된다."""
+    return f"  [완료 {hidden} 숨김]" if hidden else ""
+
+
 class AgentPanel(VerticalScroll):
     BORDER_TITLE = "Agent 상태 · 비용"
 
@@ -375,10 +380,17 @@ class AgentPanel(VerticalScroll):
         table.add_columns("상태", "타입", "지금/wf", "모델", "토큰", "시간")
         yield table
 
-    def render_agents(self, agents: list[AgentEvent]) -> None:
+    def render_agents(self, agents: list[AgentEvent], hide_completed: bool = False) -> None:
+        visible = [
+            agent
+            for agent in agents
+            if not (hide_completed and agent.status == AgentStatus.COMPLETED)
+        ]
+        self.border_title = "Agent 상태 · 비용" + _hidden_suffix(len(agents) - len(visible))
+
         table = self.query_one(DataTable)
         table.clear()
-        for agent in agents:
+        for agent in visible:
             label, style = _STATUS_STYLE.get(agent.status, (agent.status.value, "white"))
             # 실행 중이면 지금 쓰는 도구를, 워크플로우 소속이면 그 실행 id 를 보여준다
             if agent.current_tool:
@@ -528,13 +540,19 @@ class ChecklistPanel(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield ListView(id="checklist-list")
 
-    async def render_checklists(self, checklists: list[ChecklistState]) -> None:
+    async def render_checklists(
+        self, checklists: list[ChecklistState], hide_completed: bool = False
+    ) -> None:
+        hidden = sum(item.checked for cl in checklists for item in cl.items) if hide_completed else 0
+        self.border_title = "Checklist" + _hidden_suffix(hidden)
+
         listview = self.query_one(ListView)
         await listview.clear()
         if not checklists:
             await listview.append(ListItem(Label("[dim]진행 중인 .harness 체크리스트 없음[/dim]")))
             return
         for checklist in checklists:
+            # 진행률(x/y)은 숨김 여부와 무관하게 그대로 — 전체 그림은 계속 보여야 한다
             done, total = checklist.completed_count, checklist.total_count
             progress_color = "green" if total and done == total else "yellow" if done else "dim"
             await listview.append(
@@ -544,6 +562,8 @@ class ChecklistPanel(VerticalScroll):
             )
             for item in checklist.items:
                 if item.checked:
+                    if hide_completed:
+                        continue
                     await listview.append(
                         ListItem(Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"))
                     )
@@ -655,12 +675,16 @@ class ClaudeMonitorApp(App):
     }
     """
 
-    BINDINGS = [("r", "rename_session", "이름 변경")]
+    BINDINGS = [
+        ("r", "rename_session", "이름 변경"),
+        ("h", "toggle_completed", "완료 숨기기"),
+    ]
 
     def __init__(self, collector: Collector):
         super().__init__()
         self._collector = collector
         self._refreshing = False
+        self._hide_completed = False
         # 이전 폴링과 내용이 같으면 다시 그리지 않는다 — clear()+append()를 매번
         # 반복하면 데이터가 안 바뀌어도 화면이 깜빡였다(실사용 중 발견된 버그).
         self._last_messages: list[ChatMessage] | None = None
@@ -714,6 +738,13 @@ class ClaudeMonitorApp(App):
                 TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
             )
 
+    async def action_toggle_completed(self) -> None:
+        self._hide_completed = not self._hide_completed
+        # diff 캐시를 비워 다음 폴링(최대 2.5초)을 기다리지 않고 즉시 다시 그리게 한다
+        self._last_agents = None
+        self._last_checklists = None
+        await self._refresh()
+
     @work
     async def action_rename_session(self) -> None:
         session = self._collector.session
@@ -751,7 +782,7 @@ class ClaudeMonitorApp(App):
                 self._last_messages = snapshot.messages
 
             if snapshot.agents != self._last_agents:
-                self.query_one(AgentPanel).render_agents(snapshot.agents)
+                self.query_one(AgentPanel).render_agents(snapshot.agents, self._hide_completed)
                 self._last_agents = snapshot.agents
 
             if (
@@ -765,7 +796,9 @@ class ClaudeMonitorApp(App):
                 self._last_memory_entries = snapshot.memory_entries
 
             if snapshot.checklists != self._last_checklists:
-                await self.query_one(ChecklistPanel).render_checklists(snapshot.checklists)
+                await self.query_one(ChecklistPanel).render_checklists(
+                    snapshot.checklists, self._hide_completed
+                )
                 self._last_checklists = snapshot.checklists
 
             if snapshot.sessions != self._last_sessions:
