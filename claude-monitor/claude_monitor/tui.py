@@ -11,11 +11,24 @@ import subprocess
 import sys
 from pathlib import Path
 
+from rich.markup import escape
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Markdown,
+    RichLog,
+    Static,
+)
 
 from claude_monitor.collector import Collector, find_active_session
 from claude_monitor.sources import session_names
@@ -26,11 +39,77 @@ KITTY_TAB_TITLE_TIMEOUT_SECONDS = 2
 
 POLL_INTERVAL_SECONDS = 2.5
 
-_STATUS_LABEL = {
-    AgentStatus.RUNNING: "● running",
-    AgentStatus.COMPLETED: "● completed",
-    AgentStatus.FAILED: "● failed",
+# (표시 라벨, rich 스타일) — 상태를 색으로도 구분한다(텍스트만으로는 스캔이 느림)
+_STATUS_STYLE = {
+    AgentStatus.RUNNING: ("● running", "bold yellow"),
+    AgentStatus.COMPLETED: ("✓ completed", "bold green"),
+    AgentStatus.FAILED: ("✗ failed", "bold red"),
 }
+
+_MEMORY_TYPE_COLOR = {
+    "feedback": "yellow",
+    "project": "cyan",
+    "reference": "blue",
+    "user": "magenta",
+}
+
+
+MAX_VIEW_CHARS = 60_000
+
+
+class FileListItem(ListItem):
+    """클릭하면 내용을 열 수 있는 목록 항목. path가 없으면(섹션 헤더 등) 열지 않는다."""
+
+    def __init__(self, renderable: Label, path: str | None = None) -> None:
+        super().__init__(renderable)
+        self.file_path = path
+
+
+class FileViewModal(ModalScreen[None]):
+    """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달. Escape·q로 닫는다."""
+
+    CSS = """
+    FileViewModal {
+        align: center middle;
+        background: $background 60%;
+    }
+    #file-view-box {
+        width: 90%;
+        height: 85%;
+        border: round $accent;
+        background: $panel;
+        border-title-color: $text;
+        border-title-background: $primary-darken-1;
+        border-title-style: bold;
+        padding: 1 2;
+    }
+    #file-view-hint {
+        color: $text-muted;
+        padding-bottom: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self._path = Path(path)
+
+    def compose(self) -> ComposeResult:
+        box = VerticalScroll(id="file-view-box")
+        box.border_title = self._path.name
+        with box:
+            yield Static("esc / q 로 닫기", id="file-view-hint")
+            yield Markdown(self._read_text())
+
+    def _read_text(self) -> str:
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except OSError as error:
+            return f"파일을 읽을 수 없습니다\n\n`{self._path}`\n\n{error}"
+        if len(text) > MAX_VIEW_CHARS:
+            text = text[:MAX_VIEW_CHARS] + "\n\n*(이하 생략 — 파일이 너무 큼)*"
+        return text
 
 
 class ChatPanel(VerticalScroll):
@@ -43,15 +122,19 @@ class ChatPanel(VerticalScroll):
         log = self.query_one(RichLog)
         log.clear()
         for msg in messages:
-            speaker = "you " if msg.role == "user" else "claude"
-            log.write(f"[{speaker}] {msg.text}")
+            if msg.role == "user":
+                speaker = Text("you    ", style="bold cyan")
+            else:
+                speaker = Text("claude ", style="bold magenta")
+            line = speaker + Text(msg.text)
+            log.write(line)
 
 
 class AgentPanel(VerticalScroll):
     BORDER_TITLE = "Agent 상태"
 
     def compose(self) -> ComposeResult:
-        table = DataTable(id="agent-table", cursor_type="row")
+        table = DataTable(id="agent-table", cursor_type="row", zebra_stripes=True)
         table.add_columns("상태", "타입", "설명")
         yield table
 
@@ -59,12 +142,12 @@ class AgentPanel(VerticalScroll):
         table = self.query_one(DataTable)
         table.clear()
         for agent in agents:
-            label = _STATUS_LABEL.get(agent.status, agent.status.value)
-            table.add_row(label, agent.subagent_type, agent.description[:40])
+            label, style = _STATUS_STYLE.get(agent.status, (agent.status.value, "white"))
+            table.add_row(Text(label, style=style), agent.subagent_type, agent.description[:40])
 
 
 class HarnessMemoryPanel(VerticalScroll):
-    BORDER_TITLE = "Harness · Memory"
+    BORDER_TITLE = "Harness · Memory (클릭하면 내용)"
 
     def compose(self) -> ComposeResult:
         yield ListView(id="harness-memory-list")
@@ -74,12 +157,30 @@ class HarnessMemoryPanel(VerticalScroll):
     ) -> None:
         listview = self.query_one(ListView)
         await listview.clear()
-        await listview.append(ListItem(Label(f"harness 규약 {len(harness_files)}개")))
+
+        await listview.append(
+            FileListItem(Label(f"[bold cyan]harness 규약[/] · {len(harness_files)}개"))
+        )
         for harness_file in harness_files:
-            await listview.append(ListItem(Label(f"  · {harness_file.label}")))
-        await listview.append(ListItem(Label(f"memory {len(memory_entries)}개")))
-        for entry in memory_entries[:12]:
-            await listview.append(ListItem(Label(f"  · [{entry.memory_type}] {entry.file}")))
+            await listview.append(
+                FileListItem(
+                    Label(f"  [dim]·[/dim] {escape(harness_file.label)}"), path=harness_file.path
+                )
+            )
+
+        await listview.append(
+            FileListItem(Label(f"[bold cyan]memory[/] · {len(memory_entries)}개"))
+        )
+        for entry in memory_entries:
+            color = _MEMORY_TYPE_COLOR.get(entry.memory_type, "white")
+            await listview.append(
+                FileListItem(
+                    Label(
+                        f"  [dim]·[/dim] [{color}]{escape(entry.memory_type)}[/{color}] {escape(entry.file)}"
+                    ),
+                    path=entry.path or None,
+                )
+            )
 
 
 class ChecklistPanel(VerticalScroll):
@@ -92,15 +193,23 @@ class ChecklistPanel(VerticalScroll):
         listview = self.query_one(ListView)
         await listview.clear()
         if not checklists:
-            await listview.append(ListItem(Label("진행 중인 .harness 체크리스트 없음")))
+            await listview.append(ListItem(Label("[dim]진행 중인 .harness 체크리스트 없음[/dim]")))
             return
         for checklist in checklists:
+            done, total = checklist.completed_count, checklist.total_count
+            progress_color = "green" if total and done == total else "yellow" if done else "dim"
             await listview.append(
-                ListItem(Label(f"{checklist.slug}: {checklist.completed_count}/{checklist.total_count}"))
+                ListItem(
+                    Label(f"[bold]{escape(checklist.slug)}[/bold] [{progress_color}]{done}/{total}[/]")
+                )
             )
             for item in checklist.items:
-                mark = "x" if item.checked else " "
-                await listview.append(ListItem(Label(f"  [{mark}] {item.text[:50]}")))
+                if item.checked:
+                    await listview.append(
+                        ListItem(Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"))
+                    )
+                else:
+                    await listview.append(ListItem(Label(f"  [dim]☐[/dim] {escape(item.text[:50])}")))
 
 
 class RenameModal(ModalScreen[str | None]):
@@ -134,10 +243,32 @@ class ClaudeMonitorApp(App):
     Screen {
         layout: grid;
         grid-size: 2 2;
-        grid-gutter: 1;
+        grid-gutter: 1 1;
+        grid-rows: 1fr 1fr;
+        grid-columns: 1fr 1fr;
+        padding: 1;
+        background: $surface;
     }
     ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel {
-        border: round $panel;
+        border: round $primary-lighten-1;
+        background: $panel;
+        padding: 0 1;
+        border-title-color: $text;
+        border-title-background: $primary-darken-1;
+        border-title-style: bold;
+    }
+    ChatPanel:focus-within, AgentPanel:focus-within,
+    HarnessMemoryPanel:focus-within, ChecklistPanel:focus-within {
+        border: round $accent;
+    }
+    DataTable {
+        background: $panel;
+    }
+    ListView {
+        background: $panel;
+    }
+    ListView > ListItem {
+        padding: 0 1;
     }
     """
 
@@ -172,6 +303,11 @@ class ClaudeMonitorApp(App):
         session = self._collector.session
         self.title = session.display_name or session.session_id
         self.sub_title = session.cwd
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, FileListItem) and item.file_path:
+            self.push_screen(FileViewModal(item.file_path))
 
     @work
     async def action_rename_session(self) -> None:

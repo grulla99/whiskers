@@ -41,12 +41,14 @@ def read_memory_entries(index_path: str = MEMORY_INDEX_PATH) -> list[MemoryEntry
 
         entry_match = _ENTRY_RE.match(stripped)
         if entry_match:
+            file_name = entry_match.group("file")
             entries.append(
                 MemoryEntry(
                     title=entry_match.group("title"),
-                    file=entry_match.group("file"),
+                    file=file_name,
                     hook=entry_match.group("hook").strip(),
                     memory_type=current_type,
+                    path=str(path.parent / file_name),
                 )
             )
 

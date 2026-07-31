@@ -62,6 +62,7 @@ class MemoryEntry:
     file: str
     hook: str
     memory_type: str  # feedback | user | project | reference
+    path: str = ""  # 내용 조회를 위한 절대 경로 (인덱스 파일 기준으로 해석)
 
 
 @dataclass
