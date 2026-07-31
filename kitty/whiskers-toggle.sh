@@ -10,7 +10,7 @@
 # 그래서 focused -> active -> 첫 번째 순으로 폴백해 항상 한 탭을 특정한다.
 set -uo pipefail
 
-MONITOR_DIR="/Users/junho/dotfiles/claude-monitor"
+MONITOR_DIR="/Users/junho/dotfiles/whiskers"
 
 if [ -n "${KITTY_LISTEN_ON:-}" ]; then
     SOCKET="$KITTY_LISTEN_ON"
@@ -43,7 +43,7 @@ def pick(items):
 tab = pick(pick(os_windows).get("tabs") or [{}])
 monitor_id = ""
 for window in tab.get("windows", []):
-    if "claude_monitor.tui" in " ".join(window.get("cmdline", [])):
+    if "whiskers.tui" in " ".join(window.get("cmdline", [])):
         monitor_id = window["id"]
         break
 
@@ -61,5 +61,5 @@ if [ -n "${EXISTING_ID:-}" ]; then
 else
     # launch 의 --match 는 (window 가 아니라) 대상 탭을 지정한다
     kitty @ --to "$SOCKET" launch --location=vsplit --match "id:$TARGET_TAB_ID" \
-        --cwd="$MONITOR_DIR" "$MONITOR_DIR/.venv/bin/python" -m claude_monitor.tui
+        --cwd="$MONITOR_DIR" "$MONITOR_DIR/.venv/bin/python" -m whiskers.tui
 fi

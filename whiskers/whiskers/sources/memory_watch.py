@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from claude_monitor.state import MemoryEntry
+from whiskers.state import MemoryEntry
 
 MEMORY_INDEX_PATH = "~/.claude/projects/-Users-junho/memory/MEMORY.md"
 

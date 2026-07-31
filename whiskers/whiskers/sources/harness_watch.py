@@ -10,7 +10,7 @@ import glob as glob_module
 import re
 from pathlib import Path
 
-from claude_monitor.state import ChecklistItem, ChecklistState, HarnessFile
+from whiskers.state import ChecklistItem, ChecklistState, HarnessFile
 
 HARNESS_RULES_GLOBS = [
     "~/.claude/rules/*.md",

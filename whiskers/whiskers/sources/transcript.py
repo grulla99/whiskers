@@ -25,7 +25,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from claude_monitor.state import AgentEvent, AgentStatus, ChatMessage, ContextUsage, HookBlock
+from whiskers.state import AgentEvent, AgentStatus, ChatMessage, ContextUsage, HookBlock
 
 # 훅 차단은 tool_result 의 에러 문자열로 온다:
 #   "Error: PreToolUse:Agent hook error: [node ".../delegation-gate.js"]: [delegation-gate] 위임 ..."

@@ -11,8 +11,8 @@ import json
 import time
 from pathlib import Path
 
-from claude_monitor.sources import session_names
-from claude_monitor.state import SessionSummary
+from whiskers.sources import session_names
+from whiskers.state import SessionSummary
 
 SESSION_STATE_PATH = "~/.claude-ui/session_state.json"
 PROJECTS_ROOT = Path("~/.claude/projects").expanduser()

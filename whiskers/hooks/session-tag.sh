@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-monitor 용 훅 — 세션을 kitty 창에 묶고, 세션 상태(running/waiting/idle/done)를 기록한다.
+# whiskers 용 훅 — 세션을 kitty 창에 묶고, 세션 상태(running/waiting/idle/done)를 기록한다.
 #
 # 등록 위치: SessionStart / UserPromptSubmit / Stop / SessionEnd
 #

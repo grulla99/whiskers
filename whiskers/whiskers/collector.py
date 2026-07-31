@@ -2,7 +2,7 @@
 하나의 Snapshot으로 묶는 조립 지점.
 
 원안에 있던 hook 이벤트 emit(5번째 소스)은 Agent 상태를 transcript tail과
-중복 추적하는 것으로 드러나 스킵 결정됨 — `.harness/kitty-claude-monitor/context.md`
+중복 추적하는 것으로 드러나 스킵 결정됨 — `.harness/kitty-whiskers/context.md`
 결정 변경 로그 참조.
 
 어떤 UI 후보(A/B/C/D)를 고르든 이 모듈만 폴링하면 된다. 소스 하나가
@@ -17,15 +17,15 @@ import sys
 import time
 from pathlib import Path
 
-from claude_monitor.sources import (
+from whiskers.sources import (
     harness_watch,
     kitty_link,
     memory_watch,
     session_list,
     session_names,
 )
-from claude_monitor.sources.transcript import TranscriptTailer
-from claude_monitor.state import Snapshot, SessionInfo
+from whiskers.sources.transcript import TranscriptTailer
+from whiskers.state import Snapshot, SessionInfo
 
 PROJECTS_ROOT = Path("~/.claude/projects").expanduser()
 

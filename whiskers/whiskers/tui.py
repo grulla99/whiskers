@@ -5,7 +5,7 @@
 
 collector.Collector를 주기적으로 폴링해 렌더링하는 화면. 전부 읽기 전용이다 —
 타이핑해서 Claude를 구동하는 입력창은 스코프 밖으로 확정함
-(사용자 확인, .harness/kitty-claude-monitor/context.md 참조).
+(사용자 확인, .harness/kitty-whiskers/context.md 참조).
 클릭 동작: 규약·메모리·대화·차단은 내용 모달, 세션은 그 창으로 이동.
 """
 
@@ -35,10 +35,10 @@ from textual.widgets import (
     Markdown,
 )
 
-from claude_monitor.collector import Collector, find_active_session
-from claude_monitor.sources import kitty_link, session_names
-from claude_monitor.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
-from claude_monitor.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
+from whiskers.collector import Collector, find_active_session
+from whiskers.sources import kitty_link, session_names
+from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
+from whiskers.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
 
 KITTY_TAB_TITLE_TIMEOUT_SECONDS = 2
 
