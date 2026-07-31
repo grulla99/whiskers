@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from rich.markup import escape
@@ -27,8 +28,6 @@ from textual.widgets import (
     ListItem,
     ListView,
     Markdown,
-    RichLog,
-    Static,
 )
 
 from claude_monitor.collector import Collector, find_active_session
@@ -56,6 +55,44 @@ _MEMORY_TYPE_COLOR = {
 
 
 MAX_VIEW_CHARS = 60_000
+
+# 대화 미리보기: 좁은 패널에서 한 건이 화면을 다 먹지 않게 줄 수·글자 수를 함께 제한
+PREVIEW_MAX_LINES = 2
+PREVIEW_MAX_CHARS = 160
+
+
+def _format_time(timestamp: float) -> str:
+    if not timestamp:
+        return ""
+    return datetime.fromtimestamp(timestamp).strftime("%H:%M")
+
+
+_NOISE_LINE_RE = re.compile(r"^[-=*_#\s]+$")  # 구분선(---), 빈 헤딩 등 미리보기에 무의미한 줄
+
+
+def _collapse(text: str) -> str:
+    """마크다운 잡음(코드펜스·구분선)을 걷어내고 빈 줄을 접어 미리보기용으로 만든다."""
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```") or _NOISE_LINE_RE.match(stripped):
+            continue
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
+def _preview(text: str) -> str:
+    collapsed = _collapse(text)
+    lines = collapsed.splitlines()[:PREVIEW_MAX_LINES]
+    preview = "\n".join(lines)
+    if len(preview) > PREVIEW_MAX_CHARS:
+        preview = preview[:PREVIEW_MAX_CHARS].rstrip()
+    return preview or "(내용 없음)"
+
+
+def _is_truncated(text: str) -> bool:
+    collapsed = _collapse(text)
+    return len(collapsed.splitlines()) > PREVIEW_MAX_LINES or len(collapsed) > PREVIEW_MAX_CHARS
 
 # 규약·메모리 파일 앞머리의 YAML 프론트매터를 본문과 분리해 헤더로 정리한다
 # (원문 그대로 두면 `---` 구분선 + 키:값이 본문에 섞여 읽기 나쁘다).
@@ -180,22 +217,79 @@ class FileViewModal(ModalScreen[None]):
         return text
 
 
-class ChatPanel(VerticalScroll):
-    BORDER_TITLE = "대화 로그"
+class MessageListItem(ListItem):
+    """대화 한 건. 미리보기만 보여주고, 클릭하면 전문을 모달로 연다."""
+
+    def __init__(self, renderable: Label, message: ChatMessage) -> None:
+        super().__init__(renderable)
+        self.message = message
+
+
+class MessageViewModal(ModalScreen[None]):
+    """대화 한 건의 전문. Escape·q로 닫는다."""
+
+    CSS = """
+    MessageViewModal {
+        align: center middle;
+        background: $background 70%;
+    }
+    #message-view-box {
+        width: 96%;
+        height: 92%;
+        border: round $accent;
+        background: $surface;
+        border-title-color: $text;
+        border-title-background: $accent-darken-2;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
+
+    def __init__(self, message: ChatMessage) -> None:
+        super().__init__()
+        self._message = message
 
     def compose(self) -> ComposeResult:
-        yield RichLog(id="chat-log", wrap=True, markup=False, max_lines=200)
+        box = VerticalScroll(id="message-view-box")
+        speaker = "나" if self._message.role == "user" else "Claude"
+        box.border_title = f"{speaker} · {_format_time(self._message.timestamp)}"
+        box.border_subtitle = "esc · q 로 닫기"
+        with box:
+            # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
+            yield Markdown(self._message.text)
+
+
+class ChatPanel(VerticalScroll):
+    BORDER_TITLE = "대화 로그 (클릭하면 전문)"
+
+    def compose(self) -> ComposeResult:
+        yield ListView(id="chat-list")
 
     async def render_messages(self, messages: list[ChatMessage]) -> None:
-        log = self.query_one(RichLog)
-        log.clear()
-        for msg in messages:
-            if msg.role == "user":
-                speaker = Text("you    ", style="bold cyan")
-            else:
-                speaker = Text("claude ", style="bold magenta")
-            line = speaker + Text(msg.text)
-            log.write(line)
+        listview = self.query_one(ListView)
+        await listview.clear()
+        if not messages:
+            await listview.append(ListItem(Label("[dim]대화 없음[/dim]")))
+            return
+
+        # 최신이 위 — 좁은 패널에서 스크롤 없이 방금 일어난 일을 보게 한다
+        for msg in reversed(messages):
+            is_user = msg.role == "user"
+            # 테마 변수로 색을 잡아 테마를 바꿔도 따라오게 한다
+            color = "$success" if is_user else "$secondary"
+            speaker = "나" if is_user else "Claude"
+            head = (
+                f"[{color}]▍[/{color}] [bold {color}]{speaker}[/] "
+                f"[dim]{_format_time(msg.timestamp)}[/dim]"
+            )
+            preview = _preview(msg.text)
+            more = "  [dim]…[/dim]" if _is_truncated(msg.text) else ""
+            await listview.append(
+                MessageListItem(Label(f"{head}\n{escape(preview)}{more}"), message=msg)
+            )
 
 
 class AgentPanel(VerticalScroll):
@@ -307,6 +401,9 @@ class RenameModal(ModalScreen[str | None]):
 
 
 class ClaudeMonitorApp(App):
+    # kitty 가 Catppuccin Mocha 라 앱도 같은 팔레트로 맞춘다 (따로 놀지 않게)
+    theme = "catppuccin-mocha"
+
     CSS = """
     Screen {
         layout: grid;
@@ -314,29 +411,47 @@ class ClaudeMonitorApp(App):
         grid-gutter: 1 1;
         grid-rows: 1fr 1fr;
         grid-columns: 1fr 1fr;
-        padding: 1;
-        background: $surface;
+        padding: 0 1 0 1;
+        background: $background;
     }
     ChatPanel, AgentPanel, HarnessMemoryPanel, ChecklistPanel {
-        border: round $primary-lighten-1;
-        background: $panel;
-        padding: 0 1;
-        border-title-color: $text;
-        border-title-background: $primary-darken-1;
+        border: round $primary 40%;
+        background: $surface;
+        padding: 0;
+        border-title-color: $text-muted;
         border-title-style: bold;
+        border-title-align: left;
+        scrollbar-size-vertical: 1;
     }
     ChatPanel:focus-within, AgentPanel:focus-within,
     HarnessMemoryPanel:focus-within, ChecklistPanel:focus-within {
         border: round $accent;
+        border-title-color: $accent;
     }
-    DataTable {
-        background: $panel;
+    DataTable, ListView {
+        background: transparent;
     }
-    ListView {
+    DataTable > .datatable--header {
         background: $panel;
+        color: $text-muted;
+        text-style: none;
     }
     ListView > ListItem {
         padding: 0 1;
+        background: transparent;
+    }
+    ListView > ListItem.--highlight {
+        background: $primary 25%;
+    }
+    /* 대화 카드는 한 건이 2줄+헤더라 아래 여백을 줘야 서로 붙어 보이지 않는다 */
+    #chat-list > MessageListItem {
+        padding: 0 1 1 1;
+    }
+    Header {
+        background: $panel;
+    }
+    Footer {
+        background: $panel;
     }
     """
 
@@ -376,6 +491,8 @@ class ClaudeMonitorApp(App):
         item = event.item
         if isinstance(item, FileListItem) and item.file_path:
             self.push_screen(FileViewModal(item.file_path))
+        elif isinstance(item, MessageListItem):
+            self.push_screen(MessageViewModal(item.message))
 
     @work
     async def action_rename_session(self) -> None:
