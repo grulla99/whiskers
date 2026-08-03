@@ -845,25 +845,26 @@ class ClaudeMonitorApp(App):
 
     /* 호버 반응은 .clickable 이 붙은 항목에만 — 섹션 헤더나 이동할 창을 모르는 세션은
        반응하지 않아야 "눌러도 된다"는 신호가 거짓이 되지 않는다. */
+    /* transition 을 걸면 안 된다 — 호버가 풀릴 때 규칙 자체가 매칭에서 빠지면서
+       애니메이션이 끝까지 가지 못해 **중간 색이 그대로 남는다**(실측: 호버 해제 후에도
+       #5c4e52 잔류). 목표색에도 도달하지 못했다. 터미널에선 즉시 반응이 낫다. */
     ListItem.clickable {
         border-left: blank;
-        transition: background 160ms in_out_cubic;
     }
-    /* 자식(Label)에도 같은 배경을 줘야 한다 — 부모 배경이 반투명이면 자식은 그 색이 아니라
-       패널 배경으로 합성돼, 글자 있는 칸만 호버 색이 안 칠해진다(실측으로 확인) */
-    ListItem.clickable:hover,
-    ListItem.clickable:hover > Label {
-        background: $primary 18%;
-    }
+    /* 자식 Label 을 transparent 로 **명시**해야 부모의 호버 배경 위에 합성된다.
+       - 아무것도 안 주면 Label 이 패널 배경을 칠해 글자 칸만 호버색이 안 든다
+       - 자식에도 같은 반투명 색을 주면 이중 합성돼 글자 칸이 더 진해진다(#7f645d vs #5d4e52)
+       세 방식을 실측 비교해 고른 결과다. */
     ListItem.clickable:hover {
+        background: $primary 18%;
         border-left: thick $primary;
     }
-    /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
-    SessionListItem.clickable:hover,
-    SessionListItem.clickable:hover > Label {
-        background: $accent 22%;
+    ListItem.clickable:hover > Label {
+        background: transparent;
     }
+    /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
     SessionListItem.clickable:hover {
+        background: $accent 22%;
         border-left: thick $accent;
     }
     FileListItem.clickable:hover {
