@@ -473,15 +473,30 @@ class ChatPanel(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield ListView(id="chat-list")
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rendered = 0  # 이미 그린 건수 — 새로 온 것만 덧붙인다
+
     async def render_messages(self, messages: list[ChatMessage]) -> None:
         listview = self.query_one(ListView)
-        await listview.clear()
+
+        # 대화는 세션 처음부터 전부 남긴다. 매번 지우고 다시 만들면 건수에 비례해 느려지므로
+        # **늘어난 만큼만 덧붙인다**. 목록이 줄었으면(다른 세션 등) 처음부터 다시 그린다.
+        if len(messages) < self._rendered:
+            await listview.clear()
+            self._rendered = 0
         if not messages:
-            await listview.append(ListItem(Label("[dim]대화 없음[/dim]")))
+            if self._rendered == 0:
+                await listview.append(ListItem(Label("[dim]대화 없음[/dim]")))
             return
 
-        # 최신이 위 — 좁은 패널에서 스크롤 없이 방금 일어난 일을 보게 한다
-        for msg in reversed(messages):
+        new_messages = messages[self._rendered :]
+        if not new_messages:
+            return
+        self._rendered = len(messages)
+
+        # 시간순(오래된 것부터) — 처음부터 쭉 읽기 위한 순서이고, 덧붙이기와도 맞는다
+        for msg in new_messages:
             is_user = msg.role == "user"
             # 테마 변수로 색을 잡아 테마를 바꿔도 따라오게 한다
             color = "$success" if is_user else "$secondary"
@@ -495,6 +510,7 @@ class ChatPanel(VerticalScroll):
             await listview.append(
                 MessageListItem(Label(f"{head}\n{escape(preview)}{more}"), message=msg)
             )
+        listview.scroll_end(animate=False)  # 최신이 아래이므로 끝으로
 
 
 def _short_model(model: str | None) -> str:

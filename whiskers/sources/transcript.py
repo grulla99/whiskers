@@ -41,7 +41,9 @@ MAX_HOOK_BLOCKS = 30
 AGENT_TOOL_NAMES = {"Agent"}
 SUMMARY_MAX_CHARS = 200
 ASYNC_LAUNCH_MARKER = "Async agent launched successfully"
-MAX_MESSAGES = 50
+# 대화는 처음부터 다 남긴다 — "최근 몇 개"만 보이면 흐름을 못 따라간다.
+# 상한은 폭주 방지용 안전장치일 뿐이고, 넘으면 오래된 것부터 버린다.
+MAX_MESSAGES = 5000
 
 # 컨텍스트 한도는 모델명으로 단정하지 않는다 — 모델이 계속 바뀌므로 표가 낡는다.
 # `[1m]` 표기가 있으면 1M, 없으면 200k 로 보되, 관측값이 200k 를 넘으면 1M 으로 자기교정.
@@ -88,6 +90,7 @@ class TranscriptTailer:
         self._touch_seq = 0
 
     def recent_messages(self, limit: int = MAX_MESSAGES) -> list[ChatMessage]:
+        """세션 시작부터의 대화 전체 (상한에 걸리면 앞부분이 잘린다)."""
         return self._messages[-limit:]
 
     def hook_blocks(self) -> list[HookBlock]:
