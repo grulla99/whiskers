@@ -33,9 +33,11 @@ from textual.widgets import (
     ListItem,
     ListView,
     Markdown,
+    Static,
 )
 
 from whiskers.collector import Collector, find_active_session
+from whiskers import translate
 from whiskers.sources import kitty_link, session_names
 from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
 from whiskers.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
@@ -137,6 +139,16 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
 
 
 CLICKABLE_CLASS = "clickable"  # 호버 반응은 이 클래스가 붙은 항목에만 준다
+CLICKED_CLASS = "clicked"  # 클릭 순간 잠깐 붙였다 떼는 표시
+CLICK_FLASH_SECONDS = 0.28
+CLICK_ACTION_DELAY = 0.12  # 플래시가 한 프레임이라도 보이고 나서 동작하게
+
+
+def flash_clicked(item) -> None:
+    """클릭이 먹었다는 걸 눈으로 알려준다. transition 대신 클래스를 붙였다 떼는 방식 —
+    transition 은 중간 색이 남는 문제가 있었다(tests/test_hover.py 참조)."""
+    item.add_class(CLICKED_CLASS)
+    item.set_timer(CLICK_FLASH_SECONDS, lambda: item.remove_class(CLICKED_CLASS))
 
 
 class FileListItem(ListItem):
@@ -147,8 +159,148 @@ class FileListItem(ListItem):
         self.file_path = path
 
 
-class FileViewModal(ModalScreen[None]):
-    """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달. Escape·q로 닫는다."""
+MODAL_SIZE_STEPS = (60, 75, 88, 96)  # 폭·높이 퍼센트 프리셋
+MODAL_MIN_CELLS = 20  # 드래그로 줄일 수 있는 최소 크기(칸)
+
+
+class ViewModal(ModalScreen[None]):
+    """읽기 전용 내용 모달의 공통 뼈대.
+
+    - 바깥(어두운 배경) 클릭 시 닫힘
+    - 우하단 모서리를 드래그하면 크기 조절, `+`/`-` 로도 단계 조절
+    내용 모달 3종(파일·대화·차단 사유)이 같은 동작을 공유한다.
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "닫기"),
+        ("q", "dismiss", "닫기"),
+        ("plus,equals_sign", "grow", "크게"),
+        ("minus", "shrink", "작게"),
+        ("t", "toggle_translation", "번역"),
+    ]
+
+    BOX_ID = "view-box"
+    BODY_ID = ""  # 번역 대상 Markdown 위젯 id (하위 클래스가 지정)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._size_step = len(MODAL_SIZE_STEPS) - 1
+        self._resizing = False
+        self._original_body = ""
+        self._translated_body = ""
+        self._showing_translation = False
+
+    # --- 번역 -------------------------------------------------------------
+    @work(thread=True)
+    def _translate_worker(self) -> None:
+        """claude -p 호출은 수 초 걸리므로 스레드에서 — UI 가 멈추면 안 된다."""
+        translated = translate.translate(self._original_body)
+        self.app.call_from_thread(self._show_translation, translated)
+
+    def _show_translation(self, translated: str) -> None:
+        self._translated_body = translated
+        if self._showing_translation:
+            self._set_body(translated)
+            self._update_hint()
+
+    def _set_body(self, text: str) -> None:
+        if not self.BODY_ID:
+            return
+        try:
+            self.query_one(f"#{self.BODY_ID}", Markdown).update(text)
+        except Exception:
+            pass
+
+    def action_toggle_translation(self) -> None:
+        if not self.BODY_ID or not self._original_body:
+            return
+        self._showing_translation = not self._showing_translation
+
+        if not self._showing_translation:
+            self._set_body(self._original_body)
+        elif self._translated_body:
+            self._set_body(self._translated_body)
+        elif translate.cached(self._original_body):
+            self._translated_body = translate.cached(self._original_body)
+            self._set_body(self._translated_body)
+        else:
+            self._set_body("*번역 중… (처음 한 번만 걸립니다)*")
+            self._translate_worker()
+        self._update_hint()
+
+    def on_mount(self) -> None:
+        # compose 에서 border_subtitle 을 직접 넣기 때문에, 원문이 정해진 뒤 한 번 다시 그려야
+        # 번역 힌트([t 한국어])가 붙는다
+        self._update_hint()
+
+    @property
+    def box(self):
+        return self.query_one(f"#{self.BOX_ID}")
+
+    # --- 바깥 클릭으로 닫기 -------------------------------------------------
+    def on_click(self, event) -> None:
+        # `event.widget is self` 로 판정하면 상자 안을 눌러도 닫힌다(실측) —
+        # 자식에서 버블링된 이벤트가 화면에 도달하기 때문. 좌표로 직접 판정한다.
+        if not self.box.region.contains(event.screen_x, event.screen_y):
+            self.dismiss(None)
+
+    # --- 크기 조절 ---------------------------------------------------------
+    def _apply_step(self) -> None:
+        percent = MODAL_SIZE_STEPS[self._size_step]
+        box = self.box
+        box.styles.width = f"{percent}%"
+        box.styles.height = f"{percent}%"
+        self._update_hint()
+
+    def action_grow(self) -> None:
+        self._size_step = min(self._size_step + 1, len(MODAL_SIZE_STEPS) - 1)
+        self._apply_step()
+
+    def action_shrink(self) -> None:
+        self._size_step = max(self._size_step - 1, 0)
+        self._apply_step()
+
+    def _update_hint(self) -> None:
+        translation = ""
+        if self.BODY_ID and translate.looks_english(self._original_body):
+            # 대괄호는 rich 마크업으로 해석돼 화면에 백슬래시가 노출된다 — 가운뎃점을 쓴다
+            translation = "  ·  t 원문" if self._showing_translation else "  ·  t 한국어"
+        self.box.border_subtitle = f"esc·q 닫기  +/- 크기  ⇘ 드래그{translation}"
+
+    def on_mouse_down(self, event) -> None:
+        """우하단 모서리 근처에서 누르면 드래그 리사이즈 시작."""
+        box = self.box
+        region = box.region
+        near_corner = (
+            abs(event.screen_x - (region.x + region.width)) <= 2
+            and abs(event.screen_y - (region.y + region.height)) <= 2
+        )
+        if near_corner:
+            self._resizing = True
+            self.capture_mouse()
+            event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._resizing:
+            return
+        box = self.box
+        region = box.region
+        # 커서 위치까지를 새 크기로 (모달은 가운데 정렬이라 좌상단 기준으로 계산)
+        box.styles.width = max(MODAL_MIN_CELLS, event.screen_x - region.x + 1)
+        box.styles.height = max(5, event.screen_y - region.y + 1)
+
+    def on_mouse_up(self, event) -> None:
+        if self._resizing:
+            self._resizing = False
+            self.release_mouse()
+            event.stop()
+
+
+class FileViewModal(ViewModal):
+    """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달."""
+
+    BOX_ID = "file-view-box"
+    BODY_ID = "file-view-body"
 
     CSS = """
     FileViewModal {
@@ -188,8 +340,6 @@ class FileViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, path: str) -> None:
         super().__init__()
         self._path = Path(path)
@@ -200,7 +350,7 @@ class FileViewModal(ModalScreen[None]):
 
         box = VerticalScroll(id="file-view-box")
         box.border_title = self._path.name
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
 
         with box:
             with Vertical(id="file-view-head"):
@@ -209,7 +359,8 @@ class FileViewModal(ModalScreen[None]):
                     yield Label(escape(meta["description"]), id="file-view-desc")
                 if meta_line := self._format_meta(meta):
                     yield Label(meta_line, id="file-view-meta")
-            yield Markdown(body.strip(), id="file-view-body")
+            self._original_body = body.strip()
+            yield Markdown(self._original_body, id="file-view-body")
 
     @staticmethod
     def _format_meta(meta: dict[str, str]) -> str:
@@ -233,8 +384,10 @@ class FileViewModal(ModalScreen[None]):
         return text
 
 
-class TextViewModal(ModalScreen[None]):
-    """제목 + 본문 텍스트를 읽기 전용으로 보여주는 범용 모달. Escape·q로 닫는다."""
+class TextViewModal(ViewModal):
+    """제목 + 본문 텍스트를 읽기 전용으로 보여주는 범용 모달."""
+
+    BOX_ID = "text-view-box"
 
     CSS = """
     TextViewModal {
@@ -254,8 +407,6 @@ class TextViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, title: str, body: str) -> None:
         super().__init__()
         self._title = title
@@ -264,7 +415,7 @@ class TextViewModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         box = VerticalScroll(id="text-view-box")
         box.border_title = self._title
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
         with box:
             yield Label(escape(self._body))
 
@@ -277,8 +428,11 @@ class MessageListItem(ListItem):
         self.message = message
 
 
-class MessageViewModal(ModalScreen[None]):
-    """대화 한 건의 전문. Escape·q로 닫는다."""
+class MessageViewModal(ViewModal):
+    """대화 한 건의 전문."""
+
+    BOX_ID = "message-view-box"
+    BODY_ID = "message-view-body"
 
     CSS = """
     MessageViewModal {
@@ -298,8 +452,6 @@ class MessageViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, message: ChatMessage) -> None:
         super().__init__()
         self._message = message
@@ -308,10 +460,11 @@ class MessageViewModal(ModalScreen[None]):
         box = VerticalScroll(id="message-view-box")
         speaker = "나" if self._message.role == "user" else "Claude"
         box.border_title = f"{speaker} · {_format_time(self._message.timestamp)}"
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
         with box:
             # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
-            yield Markdown(self._message.text)
+            self._original_body = self._message.text
+            yield Markdown(self._original_body, id="message-view-body")
 
 
 class ChatPanel(VerticalScroll):
@@ -367,6 +520,54 @@ def _short_duration(duration_ms: int | None) -> str:
     return f"{seconds / 60:.0f}m" if seconds >= 90 else f"{seconds:.0f}s"
 
 
+class FilterToggle(Static):
+    """완료 항목 숨김 버튼. 키(`h`)와 같은 동작을 마우스로도 할 수 있게 한다."""
+
+    def render_state(self, hide_completed: bool) -> None:
+        self.update(
+            "[b]☑ 완료 숨김[/b]  [dim]클릭 또는 h 로 해제[/dim]"
+            if hide_completed
+            else "☐ 완료 숨기기  [dim]클릭 또는 h[/dim]"
+        )
+        self.set_class(hide_completed, "-active")
+
+    def on_click(self) -> None:
+        # action 이 async 이므로 워커로 띄운다
+        self.app.run_worker(self.app.action_toggle_completed())
+
+
+def _where_running(cwd: str) -> str:
+    """창 밖 세션이 어디서 도는지 한 줄로 — 워크트리면 그 이름을 집어준다."""
+    if not cwd:
+        return "위치 미상"
+    parts = Path(cwd).parts
+    if "worktrees" in parts:
+        index = parts.index("worktrees")
+        name = parts[index + 1] if index + 1 < len(parts) else "?"
+        repo = parts[index - 1].replace(".claude", "").strip("/.") or Path(cwd).parts[-3]
+        return f"워크트리 {name}"
+    return Path(cwd).name or cwd
+
+
+def _session_signature(sessions: list[SessionSummary]) -> tuple:
+    """화면에 실제로 보이는 것만 추린 비교키.
+
+    dataclass 를 통째로 비교하면 updated_at(float) 이 매 턴 바뀌어 목록을 통째로
+    다시 만든다. 재빌드 순간에 클릭하면 위젯이 사라져 **클릭이 먹히지 않는다**
+    (세션 이동이 가끔 두 번 눌러야 되던 원인). 보이는 값이 같으면 다시 그리지 않는다.
+    """
+    return tuple(
+        (s.session_id, s.title, s.state, s.awaiting_answer, s.question,
+         s.kitty_window_id, s.is_current, s.detached, _format_time(s.updated_at))
+        for s in sessions
+    )
+
+
+def _hidden_suffix(hidden: int) -> str:
+    """숨긴 개수를 제목에 붙인다 — 데이터가 조용히 사라진 것처럼 보이면 안 된다."""
+    return f"  [완료 {hidden} 숨김]" if hidden else ""
+
+
 class AgentPanel(VerticalScroll):
     BORDER_TITLE = "Agent 상태 · 비용"
 
@@ -375,10 +576,17 @@ class AgentPanel(VerticalScroll):
         table.add_columns("상태", "타입", "지금/wf", "모델", "토큰", "시간")
         yield table
 
-    def render_agents(self, agents: list[AgentEvent]) -> None:
+    def render_agents(self, agents: list[AgentEvent], hide_completed: bool = False) -> None:
+        visible = [
+            agent
+            for agent in agents
+            if not (hide_completed and agent.status == AgentStatus.COMPLETED)
+        ]
+        self.border_title = "Agent 상태 · 비용" + _hidden_suffix(len(agents) - len(visible))
+
         table = self.query_one(DataTable)
         table.clear()
-        for agent in agents:
+        for agent in visible:
             label, style = _STATUS_STYLE.get(agent.status, (agent.status.value, "white"))
             # 실행 중이면 지금 쓰는 도구를, 워크플로우 소속이면 그 실행 id 를 보여준다
             if agent.current_tool:
@@ -507,15 +715,37 @@ class SessionPanel(VerticalScroll):
             return
 
         for summary in sessions:
-            mark, color, label = _SESSION_STATE_STYLE.get(
-                summary.state, _SESSION_STATE_STYLE["unknown"]
-            )
+            if summary.detached:
+                # 이동할 창이 없다 — 숨기지 말고 "어디서 도는지"를 알려준다
+                where = _where_running(summary.cwd)
+                await listview.append(
+                    SessionListItem(
+                        Label(
+                            f"[dim]⌁[/dim] [dim]{escape(summary.title)}[/dim]\n"
+                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · 이동 불가[/dim]"
+                        ),
+                        summary=summary,
+                    )
+                )
+                continue
+            if summary.awaiting_answer:
+                # "작업중"과 구분되어야 한다 — 이건 내가 답해줘야 진행되는 상태
+                mark, color, label = "❓", "$warning", "답변 대기"
+            else:
+                mark, color, label = _SESSION_STATE_STYLE.get(
+                    summary.state, _SESSION_STATE_STYLE["unknown"]
+                )
             here = " [dim]← 여기[/dim]" if summary.is_current else ""
+            detail = (
+                f"[$warning]{escape(summary.question)}[/]"
+                if summary.awaiting_answer and summary.question
+                else f"[dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+            )
             await listview.append(
                 SessionListItem(
                     Label(
                         f"[{color}]{mark}[/{color}] {escape(summary.title)}{here}\n"
-                        f"   [dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+                        f"   {detail}"
                     ),
                     summary=summary,
                 )
@@ -523,32 +753,50 @@ class SessionPanel(VerticalScroll):
 
 
 class ChecklistPanel(VerticalScroll):
-    BORDER_TITLE = "Checklist"
+    BORDER_TITLE = "Checklist (클릭하면 전문)"
 
     def compose(self) -> ComposeResult:
         yield ListView(id="checklist-list")
 
-    async def render_checklists(self, checklists: list[ChecklistState]) -> None:
+    async def render_checklists(
+        self, checklists: list[ChecklistState], hide_completed: bool = False
+    ) -> None:
+        hidden = sum(item.checked for cl in checklists for item in cl.items) if hide_completed else 0
+        self.border_title = "Checklist" + _hidden_suffix(hidden)
+
         listview = self.query_one(ListView)
         await listview.clear()
         if not checklists:
             await listview.append(ListItem(Label("[dim]진행 중인 .harness 체크리스트 없음[/dim]")))
             return
         for checklist in checklists:
+            # 진행률(x/y)은 숨김 여부와 무관하게 그대로 — 전체 그림은 계속 보여야 한다
             done, total = checklist.completed_count, checklist.total_count
             progress_color = "green" if total and done == total else "yellow" if done else "dim"
             await listview.append(
-                ListItem(
-                    Label(f"[bold]{escape(checklist.slug)}[/bold] [{progress_color}]{done}/{total}[/]")
+                FileListItem(
+                    Label(f"[bold]{escape(checklist.slug)}[/bold] [{progress_color}]{done}/{total}[/]"),
+                    path=checklist.path,
                 )
             )
             for item in checklist.items:
                 if item.checked:
+                    if hide_completed:
+                        continue
                     await listview.append(
-                        ListItem(Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"))
+                        FileListItem(
+                            # 자르지 않는다 — 항목 대부분이 50자를 넘어 잘리면 뜻이 사라진다
+                            # (실측: 23개 중 18개 초과, 최대 246자). 좁은 패널에선 줄바꿈된다
+                            Label(f"  [green]✓[/green] [dim strike]{escape(item.text)}[/]"),
+                            path=checklist.path,
+                        )
                     )
                 else:
-                    await listview.append(ListItem(Label(f"  [dim]☐[/dim] {escape(item.text[:50])}")))
+                    await listview.append(
+                        FileListItem(
+                            Label(f"  [dim]☐[/dim] {escape(item.text)}"), path=checklist.path
+                        )
+                    )
 
 
 class RenameModal(ModalScreen[str | None]):
@@ -578,8 +826,10 @@ class RenameModal(ModalScreen[str | None]):
 
 
 class ClaudeMonitorApp(App):
-    # kitty 가 Catppuccin Mocha 라 앱도 같은 팔레트로 맞춘다 (따로 놀지 않게)
-    theme = "catppuccin-mocha"
+    # kitty 가 Catppuccin Mocha 라 앱도 같은 팔레트로 맞춘다 (따로 놀지 않게).
+    # 주의: App.theme 은 reactive 다. 클래스 속성으로 문자열을 넣으면 reactive 를
+    # 덮어써서 이후 테마 변경이 전혀 반영되지 않는다 — on_mount 에서 대입할 것.
+    DEFAULT_THEME = "catppuccin-mocha"
 
     CSS = """
     Screen {
@@ -631,13 +881,29 @@ class ClaudeMonitorApp(App):
 
     /* 호버 반응은 .clickable 이 붙은 항목에만 — 섹션 헤더나 이동할 창을 모르는 세션은
        반응하지 않아야 "눌러도 된다"는 신호가 거짓이 되지 않는다. */
+    /* transition 을 걸면 안 된다 — 호버가 풀릴 때 규칙 자체가 매칭에서 빠지면서
+       애니메이션이 끝까지 가지 못해 **중간 색이 그대로 남는다**(실측: 호버 해제 후에도
+       #5c4e52 잔류). 목표색에도 도달하지 못했다. 터미널에선 즉시 반응이 낫다. */
     ListItem.clickable {
         border-left: blank;
-        transition: background 160ms in_out_cubic;
     }
+    /* 자식 Label 을 transparent 로 **명시**해야 부모의 호버 배경 위에 합성된다.
+       - 아무것도 안 주면 Label 이 패널 배경을 칠해 글자 칸만 호버색이 안 든다
+       - 자식에도 같은 반투명 색을 주면 이중 합성돼 글자 칸이 더 진해진다(#7f645d vs #5d4e52)
+       세 방식을 실측 비교해 고른 결과다. */
     ListItem.clickable:hover {
         background: $primary 18%;
         border-left: thick $primary;
+    }
+    ListItem.clickable:hover > Label {
+        background: transparent;
+    }
+    /* 클릭 순간 — 호버보다 확실히 진하게 해서 "눌렸다"가 분명히 보이게 */
+    ListItem.clicked {
+        background: $accent 85%;
+    }
+    ListItem.clicked > Label {
+        background: transparent;
     }
     /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
     SessionListItem.clickable:hover {
@@ -653,14 +919,37 @@ class ClaudeMonitorApp(App):
     Footer {
         background: $panel;
     }
+    #bottom-bar {
+        dock: bottom;
+        height: 2;
+    }
+    /* 완료 숨김 버튼 — Footer 바로 위 1줄. 좁은 분할 패널이라 높이를 아낀다 */
+    FilterToggle {
+        height: 1;
+        padding: 0 1;
+        background: $surface;
+        color: $text-muted;
+    }
+    FilterToggle:hover {
+        background: $primary 25%;
+        color: $text;
+    }
+    FilterToggle.-active {
+        background: $accent 25%;
+        color: $text;
+    }
     """
 
-    BINDINGS = [("r", "rename_session", "이름 변경")]
+    BINDINGS = [
+        ("r", "rename_session", "이름 변경"),
+        ("h", "toggle_completed", "완료 숨기기"),
+    ]
 
     def __init__(self, collector: Collector):
         super().__init__()
         self._collector = collector
         self._refreshing = False
+        self._hide_completed = False
         # 이전 폴링과 내용이 같으면 다시 그리지 않는다 — clear()+append()를 매번
         # 반복하면 데이터가 안 바뀌어도 화면이 깜빡였다(실사용 중 발견된 버그).
         self._last_messages: list[ChatMessage] | None = None
@@ -679,9 +968,15 @@ class ClaudeMonitorApp(App):
         yield ChecklistPanel(id="panel-checklist")
         yield SessionPanel(id="panel-session")
         yield HookPanel(id="panel-hook")
-        yield Footer()
+        # 버튼과 Footer 를 같은 컨테이너에 넣는다 — 둘 다 dock:bottom 으로 두면
+        # 영역이 완전히 겹쳐 클릭이 Footer 로 먹힌다(실측으로 확인).
+        with Vertical(id="bottom-bar"):
+            yield FilterToggle(id="filter-toggle")
+            yield Footer()
 
     async def on_mount(self) -> None:
+        self.theme = self.DEFAULT_THEME
+        self.query_one(FilterToggle).render_state(self._hide_completed)
         self._update_title()
         await self._refresh()
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
@@ -702,17 +997,32 @@ class ClaudeMonitorApp(App):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
+        if item is None or CLICKABLE_CLASS not in item.classes:
+            return
+        # 눌린 걸 먼저 보여주고 동작한다 — 모달이 덮거나 탭이 바뀌면 플래시를 볼 틈이 없다
+        flash_clicked(item)
+        self.set_timer(CLICK_ACTION_DELAY, lambda: self._activate(item))
+
+    def _activate(self, item) -> None:
         if isinstance(item, FileListItem) and item.file_path:
             self.push_screen(FileViewModal(item.file_path))
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
         elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
-            kitty_link.focus_window(item.summary.kitty_window_id)
+            kitty_link.jump_to_session(item.summary.kitty_window_id)
         elif isinstance(item, HookBlockListItem):
             block = item.block
             self.push_screen(
                 TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
             )
+
+    async def action_toggle_completed(self) -> None:
+        self._hide_completed = not self._hide_completed
+        self.query_one(FilterToggle).render_state(self._hide_completed)
+        # diff 캐시를 비워 다음 폴링(최대 2.5초)을 기다리지 않고 즉시 다시 그리게 한다
+        self._last_agents = None
+        self._last_checklists = None
+        await self._refresh()
 
     @work
     async def action_rename_session(self) -> None:
@@ -751,7 +1061,7 @@ class ClaudeMonitorApp(App):
                 self._last_messages = snapshot.messages
 
             if snapshot.agents != self._last_agents:
-                self.query_one(AgentPanel).render_agents(snapshot.agents)
+                self.query_one(AgentPanel).render_agents(snapshot.agents, self._hide_completed)
                 self._last_agents = snapshot.agents
 
             if (
@@ -765,12 +1075,19 @@ class ClaudeMonitorApp(App):
                 self._last_memory_entries = snapshot.memory_entries
 
             if snapshot.checklists != self._last_checklists:
-                await self.query_one(ChecklistPanel).render_checklists(snapshot.checklists)
+                await self.query_one(ChecklistPanel).render_checklists(
+                    snapshot.checklists, self._hide_completed
+                )
                 self._last_checklists = snapshot.checklists
 
-            if snapshot.sessions != self._last_sessions:
+            session_signature = _session_signature(snapshot.sessions)
+            if session_signature != self._last_sessions:
                 await self.query_one(SessionPanel).render_sessions(snapshot.sessions)
-                self._last_sessions = snapshot.sessions
+                self._last_sessions = session_signature
+                # 다른 탭에서도 알아채도록 탭바가 읽을 파일을 갱신한다
+                kitty_link.publish_attention_tabs(
+                    [s.kitty_window_id for s in snapshot.sessions if s.awaiting_answer]
+                )
 
             if snapshot.hook_blocks != self._last_hook_blocks:
                 await self.query_one(HookPanel).render_blocks(snapshot.hook_blocks)
