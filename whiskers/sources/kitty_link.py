@@ -79,6 +79,43 @@ def publish_attention_tabs(window_ids: list[str]) -> None:
         pass
 
 
+TOGGLE_SCRIPT = Path("~/.config/kitty/scripts/whiskers-toggle.sh").expanduser()
+
+
+def jump_to_session(window_id: str | int) -> None:
+    """세션 창으로 이동하고, 그 탭에 모니터가 없으면 함께 띄운다.
+
+    옮겨갔는데 패널이 없으면 다시 cmd+m 을 눌러야 해서 번거롭다.
+    """
+    focus_window(window_id)
+
+    target_tab = None
+    for os_window in _kitty_ls():
+        for tab in os_window.get("tabs") or []:
+            windows = tab.get("windows") or []
+            if not any(str(w.get("id")) == str(window_id) for w in windows):
+                continue
+            target_tab = tab
+            break
+
+    if target_tab is None:
+        return
+    already_open = any(
+        "whiskers.tui" in " ".join(w.get("cmdline") or [])
+        for w in target_tab.get("windows") or []
+    )
+    if already_open or not TOGGLE_SCRIPT.is_file():
+        return
+
+    try:
+        # 토글 스크립트는 "포커스된 탭"을 대상으로 하므로, 위에서 먼저 포커스를 옮겨둔다
+        subprocess.run(
+            [str(TOGGLE_SCRIPT)], capture_output=True, timeout=KITTY_TIMEOUT_SECONDS
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def focus_window(window_id: str | int) -> None:
     """세션 목록에서 고른 세션의 창으로 이동한다."""
     try:

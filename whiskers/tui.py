@@ -140,7 +140,8 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
 
 CLICKABLE_CLASS = "clickable"  # 호버 반응은 이 클래스가 붙은 항목에만 준다
 CLICKED_CLASS = "clicked"  # 클릭 순간 잠깐 붙였다 떼는 표시
-CLICK_FLASH_SECONDS = 0.18
+CLICK_FLASH_SECONDS = 0.28
+CLICK_ACTION_DELAY = 0.12  # 플래시가 한 프레임이라도 보이고 나서 동작하게
 
 
 def flash_clicked(item) -> None:
@@ -899,7 +900,7 @@ class ClaudeMonitorApp(App):
     }
     /* 클릭 순간 — 호버보다 확실히 진하게 해서 "눌렸다"가 분명히 보이게 */
     ListItem.clicked {
-        background: $accent 55%;
+        background: $accent 85%;
     }
     ListItem.clicked > Label {
         background: transparent;
@@ -996,14 +997,19 @@ class ClaudeMonitorApp(App):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
-        if item is not None and CLICKABLE_CLASS in item.classes:
-            flash_clicked(item)
+        if item is None or CLICKABLE_CLASS not in item.classes:
+            return
+        # 눌린 걸 먼저 보여주고 동작한다 — 모달이 덮거나 탭이 바뀌면 플래시를 볼 틈이 없다
+        flash_clicked(item)
+        self.set_timer(CLICK_ACTION_DELAY, lambda: self._activate(item))
+
+    def _activate(self, item) -> None:
         if isinstance(item, FileListItem) and item.file_path:
             self.push_screen(FileViewModal(item.file_path))
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
         elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
-            kitty_link.focus_window(item.summary.kitty_window_id)
+            kitty_link.jump_to_session(item.summary.kitty_window_id)
         elif isinstance(item, HookBlockListItem):
             block = item.block
             self.push_screen(
