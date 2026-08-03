@@ -37,6 +37,7 @@ from textual.widgets import (
 )
 
 from whiskers.collector import Collector, find_active_session
+from whiskers import translate
 from whiskers.sources import kitty_link, session_names
 from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
 from whiskers.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
@@ -165,14 +166,62 @@ class ViewModal(ModalScreen[None]):
         ("q", "dismiss", "닫기"),
         ("plus,equals_sign", "grow", "크게"),
         ("minus", "shrink", "작게"),
+        ("t", "toggle_translation", "번역"),
     ]
 
     BOX_ID = "view-box"
+    BODY_ID = ""  # 번역 대상 Markdown 위젯 id (하위 클래스가 지정)
 
     def __init__(self) -> None:
         super().__init__()
         self._size_step = len(MODAL_SIZE_STEPS) - 1
         self._resizing = False
+        self._original_body = ""
+        self._translated_body = ""
+        self._showing_translation = False
+
+    # --- 번역 -------------------------------------------------------------
+    @work(thread=True)
+    def _translate_worker(self) -> None:
+        """claude -p 호출은 수 초 걸리므로 스레드에서 — UI 가 멈추면 안 된다."""
+        translated = translate.translate(self._original_body)
+        self.app.call_from_thread(self._show_translation, translated)
+
+    def _show_translation(self, translated: str) -> None:
+        self._translated_body = translated
+        if self._showing_translation:
+            self._set_body(translated)
+            self._update_hint()
+
+    def _set_body(self, text: str) -> None:
+        if not self.BODY_ID:
+            return
+        try:
+            self.query_one(f"#{self.BODY_ID}", Markdown).update(text)
+        except Exception:
+            pass
+
+    def action_toggle_translation(self) -> None:
+        if not self.BODY_ID or not self._original_body:
+            return
+        self._showing_translation = not self._showing_translation
+
+        if not self._showing_translation:
+            self._set_body(self._original_body)
+        elif self._translated_body:
+            self._set_body(self._translated_body)
+        elif translate.cached(self._original_body):
+            self._translated_body = translate.cached(self._original_body)
+            self._set_body(self._translated_body)
+        else:
+            self._set_body("*번역 중… (처음 한 번만 걸립니다)*")
+            self._translate_worker()
+        self._update_hint()
+
+    def on_mount(self) -> None:
+        # compose 에서 border_subtitle 을 직접 넣기 때문에, 원문이 정해진 뒤 한 번 다시 그려야
+        # 번역 힌트([t 한국어])가 붙는다
+        self._update_hint()
 
     @property
     def box(self):
@@ -202,7 +251,11 @@ class ViewModal(ModalScreen[None]):
         self._apply_step()
 
     def _update_hint(self) -> None:
-        self.box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        translation = ""
+        if self.BODY_ID and translate.looks_english(self._original_body):
+            # 대괄호는 rich 마크업으로 해석돼 화면에 백슬래시가 노출된다 — 가운뎃점을 쓴다
+            translation = "  ·  t 원문" if self._showing_translation else "  ·  t 한국어"
+        self.box.border_subtitle = f"esc·q 닫기  +/- 크기  ⇘ 드래그{translation}"
 
     def on_mouse_down(self, event) -> None:
         """우하단 모서리 근처에서 누르면 드래그 리사이즈 시작."""
@@ -237,6 +290,7 @@ class FileViewModal(ViewModal):
     """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달."""
 
     BOX_ID = "file-view-box"
+    BODY_ID = "file-view-body"
 
     CSS = """
     FileViewModal {
@@ -295,7 +349,8 @@ class FileViewModal(ViewModal):
                     yield Label(escape(meta["description"]), id="file-view-desc")
                 if meta_line := self._format_meta(meta):
                     yield Label(meta_line, id="file-view-meta")
-            yield Markdown(body.strip(), id="file-view-body")
+            self._original_body = body.strip()
+            yield Markdown(self._original_body, id="file-view-body")
 
     @staticmethod
     def _format_meta(meta: dict[str, str]) -> str:
@@ -367,6 +422,7 @@ class MessageViewModal(ViewModal):
     """대화 한 건의 전문."""
 
     BOX_ID = "message-view-box"
+    BODY_ID = "message-view-body"
 
     CSS = """
     MessageViewModal {
@@ -397,7 +453,8 @@ class MessageViewModal(ViewModal):
         box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
         with box:
             # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
-            yield Markdown(self._message.text)
+            self._original_body = self._message.text
+            yield Markdown(self._original_body, id="message-view-body")
 
 
 class ChatPanel(VerticalScroll):
