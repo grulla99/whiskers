@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 CACHE_DIR = Path("~/.claude-ui/translations").expanduser()
+CACHE_MAX_FILES = 200  # 문서가 바뀔 때마다 새 항목이 생기므로 상한을 둔다
 TIMEOUT_SECONDS = 180
 MAX_INPUT_CHARS = 20_000  # 그 이상은 한 번에 번역시키지 않는다(느리고 잘림 위험)
 
@@ -101,10 +102,24 @@ def translate(text: str) -> str:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_path(text).write_text(translated, encoding="utf-8")
+        prune_cache()
     except OSError:
         pass  # 캐시 실패는 번역 결과를 버릴 이유가 아니다
 
     return translated
+
+
+def prune_cache(max_files: int = CACHE_MAX_FILES) -> None:
+    """오래된 캐시부터 지워 상한을 지킨다 — 문서가 바뀔 때마다 항목이 늘기 때문."""
+    try:
+        entries = sorted(CACHE_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for stale in entries[: max(0, len(entries) - max_files)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 def looks_english(text: str, sample_chars: int = 2000) -> bool:

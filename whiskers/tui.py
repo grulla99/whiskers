@@ -703,7 +703,7 @@ class SessionPanel(VerticalScroll):
 
 
 class ChecklistPanel(VerticalScroll):
-    BORDER_TITLE = "Checklist"
+    BORDER_TITLE = "Checklist (클릭하면 전문)"
 
     def compose(self) -> ComposeResult:
         yield ListView(id="checklist-list")
@@ -724,8 +724,9 @@ class ChecklistPanel(VerticalScroll):
             done, total = checklist.completed_count, checklist.total_count
             progress_color = "green" if total and done == total else "yellow" if done else "dim"
             await listview.append(
-                ListItem(
-                    Label(f"[bold]{escape(checklist.slug)}[/bold] [{progress_color}]{done}/{total}[/]")
+                FileListItem(
+                    Label(f"[bold]{escape(checklist.slug)}[/bold] [{progress_color}]{done}/{total}[/]"),
+                    path=checklist.path,
                 )
             )
             for item in checklist.items:
@@ -733,10 +734,17 @@ class ChecklistPanel(VerticalScroll):
                     if hide_completed:
                         continue
                     await listview.append(
-                        ListItem(Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"))
+                        FileListItem(
+                            Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"),
+                            path=checklist.path,
+                        )
                     )
                 else:
-                    await listview.append(ListItem(Label(f"  [dim]☐[/dim] {escape(item.text[:50])}")))
+                    await listview.append(
+                        FileListItem(
+                            Label(f"  [dim]☐[/dim] {escape(item.text[:50])}"), path=checklist.path
+                        )
+                    )
 
 
 class RenameModal(ModalScreen[str | None]):

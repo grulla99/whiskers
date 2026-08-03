@@ -78,7 +78,29 @@ def _pending_question(transcript: Path) -> str | None:
     return list(asked.values())[-1][:QUESTION_MAX_CHARS]
 
 
+# ai-title 을 찾으려면 파일 전체를 훑어야 한다. 2.5초마다 도는 폴링에서 매번 하면
+# 세션 수·파일 크기에 비례해 비용이 커진다(실측: 폴링 67ms 중 58ms 가 이 스캔이었다).
+# 파일이 바뀌지 않았으면 재사용한다. 키는 (경로, mtime, 크기).
+_TITLE_CACHE: dict[str, tuple[float, int, str | None]] = {}
+
+
 def _read_ai_title(transcript: Path) -> str | None:
+    try:
+        stat = transcript.stat()
+    except OSError:
+        return None
+
+    key = str(transcript)
+    hit = _TITLE_CACHE.get(key)
+    if hit is not None and hit[0] == stat.st_mtime and hit[1] == stat.st_size:
+        return hit[2]
+
+    title = _scan_ai_title(transcript)
+    _TITLE_CACHE[key] = (stat.st_mtime, stat.st_size, title)
+    return title
+
+
+def _scan_ai_title(transcript: Path) -> str | None:
     """가장 마지막 ai-title 레코드를 쓴다 (대화가 진행되며 갱신되므로)."""
     title = None
     try:

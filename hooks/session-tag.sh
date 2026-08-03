@@ -65,6 +65,17 @@ if os.environ.get("KITTY_WINDOW_ID"):
     entry["kitty_window_id"] = os.environ["KITTY_WINDOW_ID"]
 data[session_id] = entry
 
+# 끝난 지 오래된 세션은 버린다 — 안 그러면 이 파일이 무한히 커진다
+CUTOFF = 60 * 60 * 24 * 3
+now = time.time()
+data = {
+    key: value
+    for key, value in data.items()
+    if key == session_id
+    or not isinstance(value, dict)
+    or now - float(value.get("updated_at") or 0) < CUTOFF
+}
+
 # 여러 세션이 동시에 쓰므로 원자적 교체 (부분 기록된 JSON 이 남지 않게)
 handle, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
 try:
