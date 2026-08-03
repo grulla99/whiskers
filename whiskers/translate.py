@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
@@ -84,6 +85,8 @@ def translate(text: str) -> str:
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECONDS,
+            # 이 호출도 Claude 세션이라 훅이 세션 목록에 등록해버린다 — 표시해서 제외시킨다
+            env={**os.environ, "WHISKERS_INTERNAL": "1"},
             # 반드시 프로젝트 밖에서 돌린다 — 레포 안에서 돌리면 CLAUDE.md·규약을 로드해
             # 번역 대신 엉뚱한 작업 결과를 내놓는다(실측: 70초 걸리고 결과도 틀렸다)
             cwd=tempfile.gettempdir(),

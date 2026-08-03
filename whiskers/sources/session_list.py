@@ -17,6 +17,7 @@ from whiskers.state import SessionSummary
 SESSION_STATE_PATH = "~/.claude-ui/session_state.json"
 PROJECTS_ROOT = Path("~/.claude/projects").expanduser()
 STALE_AFTER_SECONDS = 60 * 60 * 12  # 반나절 넘게 소식 없는 세션은 목록에서 뺀다
+ACTIVE_WITHIN_SECONDS = 15  # 이 안에 transcript 가 자랐으면 실제로 작업 중
 TITLE_MAX_CHARS = 46
 
 
@@ -132,6 +133,10 @@ def read_sessions(
         updated_at = float(entry.get("updated_at") or 0)
         if entry.get("state") == "done" or now - updated_at > STALE_AFTER_SECONDS:
             continue
+        # 창이 없는 세션은 목록에 둘 이유가 없다 — 클릭해도 이동할 데가 없고,
+        # 대개 사용자가 연 적 없는 비대화형 세션이다(워크트리·백그라운드 작업 등)
+        if not entry.get("kitty_window_id"):
+            continue
 
         transcript = next(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"), None)
         title = (
@@ -140,11 +145,20 @@ def read_sessions(
             or session_id[:8]
         )
         question = _pending_question(transcript) if transcript else None
+        state = entry.get("state") or "unknown"
+        # 훅의 Stop 은 다른 Stop 훅이 종료를 막아도 발화한다 — 그래서 아직 일하는 중인데
+        # 'waiting' 으로 굳는 경우가 있다. transcript 가 방금 자랐으면 실제로는 작업 중이다.
+        if state == "waiting" and transcript is not None:
+            try:
+                if now - transcript.stat().st_mtime < ACTIVE_WITHIN_SECONDS:
+                    state = "running"
+            except OSError:
+                pass
         summaries.append(
             SessionSummary(
                 session_id=session_id,
                 title=title[:TITLE_MAX_CHARS],
-                state=entry.get("state") or "unknown",
+                state=state,
                 updated_at=updated_at,
                 cwd=entry.get("cwd") or "",
                 kitty_window_id=entry.get("kitty_window_id"),

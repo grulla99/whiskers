@@ -9,6 +9,11 @@
 #  2) 절대 실패로 Claude 를 막지 않는다 — 무슨 일이 있어도 exit 0.
 set -uo pipefail
 
+# Whiskers 가 내부적으로 띄운 claude(번역 등)는 사용자의 세션이 아니다 — 목록을 더럽히지 않는다
+if [ -n "${WHISKERS_INTERNAL:-}" ]; then
+    exit 0
+fi
+
 CM_PAYLOAD=$(cat 2>/dev/null || echo '{}')
 CM_STATE_FILE="$HOME/.claude-ui/session_state.json"
 export CM_PAYLOAD CM_STATE_FILE
