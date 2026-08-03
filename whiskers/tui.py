@@ -1008,6 +1008,10 @@ class ClaudeMonitorApp(App):
             if snapshot.sessions != self._last_sessions:
                 await self.query_one(SessionPanel).render_sessions(snapshot.sessions)
                 self._last_sessions = snapshot.sessions
+                # 다른 탭에서도 알아채도록 탭바가 읽을 파일을 갱신한다
+                kitty_link.publish_attention_tabs(
+                    [s.kitty_window_id for s in snapshot.sessions if s.awaiting_answer]
+                )
 
             if snapshot.hook_blocks != self._last_hook_blocks:
                 await self.query_one(HookPanel).render_blocks(snapshot.hook_blocks)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 
 KITTY_TIMEOUT_SECONDS = 3
 SESSION_USER_VAR = "CLAUDE_SESSION_ID"
@@ -52,6 +53,30 @@ def session_id_for_current_window() -> str | None:
                     return session_id
             return None
     return None
+
+
+ATTENTION_FILE = Path("~/.claude-ui/attention_tabs.json").expanduser()
+
+
+def publish_attention_tabs(window_ids: list[str]) -> None:
+    """주목이 필요한 창들이 속한 **탭 id** 를 파일로 남긴다.
+
+    kitty 탭바(`kitty/tab_bar.py`)가 이 파일을 읽어 마커를 그린다 — 다른 탭을 보고 있어도
+    답변 대기 중인 세션을 알아채게 하기 위함. macOS 알림은 권한에 막히고 kitten notify 는
+    tty 를 요구해서, 탭바가 유일하게 동작하는 경로였다.
+    """
+    wanted = {str(w) for w in window_ids if w}
+    tab_ids: list[int] = []
+    for os_window in _kitty_ls():
+        for tab in os_window.get("tabs") or []:
+            if any(str(w.get("id")) in wanted for w in tab.get("windows") or []):
+                tab_ids.append(tab.get("id"))
+
+    try:
+        ATTENTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ATTENTION_FILE.write_text(json.dumps(sorted(tab_ids)), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def focus_window(window_id: str | int) -> None:

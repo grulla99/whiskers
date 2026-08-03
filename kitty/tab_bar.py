@@ -1,4 +1,13 @@
-"""Cyberpunk neon tab bar — minimal, sharp, glowing."""
+"""Cyberpunk neon tab bar — minimal, sharp, glowing.
+
+Whiskers 연동: 답변을 기다리는 Claude 세션이 있는 탭에 ❗ 마커를 그린다.
+Whiskers 가 `~/.claude-ui/attention_tabs.json` 에 탭 id 목록을 써두면 여기서 읽는다
+(macOS 알림은 권한에 막히고 kitten notify 는 tty 를 요구해, 탭바가 유일한 경로였다).
+탭바는 매 프레임 그려지므로 mtime 이 바뀔 때만 다시 읽는다.
+"""
+
+import json
+import os
 
 from kitty.fast_data_types import Screen
 from kitty.tab_bar import (
@@ -26,6 +35,27 @@ NEON = [
 VOID = "#1B2C3D"         # Match terminal background
 DIM_TEXT = "#4A5A6D"     # Ghost text for inactive
 ACTIVE_FG = "#E8E8F0"   # Bright white-blue
+
+
+ATTENTION_FILE = os.path.expanduser("~/.claude-ui/attention_tabs.json")
+ATTENTION_MARK = "❗"
+_attention_cache: dict = {"mtime": -1.0, "tabs": frozenset()}
+
+
+def _tabs_needing_attention() -> frozenset:
+    """Whiskers 가 표시한 '답변 대기' 탭 id 집합. 파일이 없거나 깨져도 조용히 빈 집합."""
+    try:
+        mtime = os.path.getmtime(ATTENTION_FILE)
+    except OSError:
+        return frozenset()
+    if mtime != _attention_cache["mtime"]:
+        try:
+            with open(ATTENTION_FILE, encoding="utf-8") as handle:
+                _attention_cache["tabs"] = frozenset(json.load(handle))
+        except Exception:
+            _attention_cache["tabs"] = frozenset()
+        _attention_cache["mtime"] = mtime
+    return _attention_cache["tabs"]
 
 
 def _hex(h: str) -> int:
@@ -65,6 +95,7 @@ def draw_tab(
     extra_data: ExtraData,
 ) -> int:
     i = (index - 1) % len(NEON)
+    needs_attention = tab.tab_id in _tabs_needing_attention()
 
     if tab.is_active:
         # ▎neon accent bar
@@ -72,10 +103,10 @@ def draw_tab(
         screen.cursor.bg = _glow_bg[i]
         screen.draw("▎")
 
-        # tab number in neon
+        # tab number in neon (답변 대기면 마커를 앞에)
         screen.cursor.fg = _neon[i]
         screen.cursor.bg = _glow_bg[i]
-        screen.draw(f"{index}")
+        screen.draw(f"{ATTENTION_MARK}{index}" if needs_attention else f"{index}")
 
         # separator dot
         screen.cursor.fg = _hex(_mix(NEON[i], VOID, 0.5))
@@ -100,7 +131,11 @@ def draw_tab(
         screen.cursor.bg = _void
         screen.draw(" ")
 
-        # number in dimmed neon
+        # number in dimmed neon — 답변 대기면 마커를 밝게 (다른 탭을 볼 때 알아채는 게 목적)
+        if needs_attention:
+            screen.cursor.fg = _neon[i]
+            screen.cursor.bg = _void
+            screen.draw(ATTENTION_MARK)
         screen.cursor.fg = _neon_dim[i]
         screen.cursor.bg = _void
         screen.draw(f"{index}")
