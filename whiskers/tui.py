@@ -849,13 +849,21 @@ class ClaudeMonitorApp(App):
         border-left: blank;
         transition: background 160ms in_out_cubic;
     }
-    ListItem.clickable:hover {
+    /* 자식(Label)에도 같은 배경을 줘야 한다 — 부모 배경이 반투명이면 자식은 그 색이 아니라
+       패널 배경으로 합성돼, 글자 있는 칸만 호버 색이 안 칠해진다(실측으로 확인) */
+    ListItem.clickable:hover,
+    ListItem.clickable:hover > Label {
         background: $primary 18%;
+    }
+    ListItem.clickable:hover {
         border-left: thick $primary;
     }
     /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
-    SessionListItem.clickable:hover {
+    SessionListItem.clickable:hover,
+    SessionListItem.clickable:hover > Label {
         background: $accent 22%;
+    }
+    SessionListItem.clickable:hover {
         border-left: thick $accent;
     }
     FileListItem.clickable:hover {
