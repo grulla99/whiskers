@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -17,6 +18,27 @@ MAX_INPUT_CHARS = 20_000  # 그 이상은 한 번에 번역시키지 않는다(�
 
 # 번역은 기계적인 작업이라 가장 싼 모델로 충분하다 (performance.md: 싼 작업은 싸게)
 TRANSLATE_MODEL = "haiku"
+
+# kitty 가 띄운 프로세스는 쉘 rc 를 거치지 않아 PATH 가 빈약하다
+# (실측: /Applications/kitty.app/Contents/MacOS:/usr/bin:/bin:/usr/sbin:/sbin — homebrew 없음).
+# 그래서 `claude` 를 이름만으로 실행하면 FileNotFoundError 가 난다. 직접 찾아 쓴다.
+_FALLBACK_CLAUDE_PATHS = (
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "~/.local/bin/claude",
+    "~/.claude/local/claude",
+)
+
+
+def find_claude() -> str | None:
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in _FALLBACK_CLAUDE_PATHS:
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return str(path)
+    return None
 
 PROMPT = (
     "아래 마크다운을 한국어로 번역해줘. "
@@ -50,10 +72,14 @@ def translate(text: str) -> str:
     if hit is not None:
         return hit
 
+    claude_bin = find_claude()
+    if claude_bin is None:
+        return f"{text}\n\n---\n*(번역 실패: `claude` 실행파일을 찾지 못했습니다)*"
+
     body = text[:MAX_INPUT_CHARS]
     try:
         completed = subprocess.run(
-            ["claude", "-p", "--model", TRANSLATE_MODEL, PROMPT + body],
+            [claude_bin, "-p", "--model", TRANSLATE_MODEL, PROMPT + body],
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECONDS,
