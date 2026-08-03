@@ -148,8 +148,95 @@ class FileListItem(ListItem):
         self.file_path = path
 
 
-class FileViewModal(ModalScreen[None]):
-    """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달. Escape·q로 닫는다."""
+MODAL_SIZE_STEPS = (60, 75, 88, 96)  # 폭·높이 퍼센트 프리셋
+MODAL_MIN_CELLS = 20  # 드래그로 줄일 수 있는 최소 크기(칸)
+
+
+class ViewModal(ModalScreen[None]):
+    """읽기 전용 내용 모달의 공통 뼈대.
+
+    - 바깥(어두운 배경) 클릭 시 닫힘
+    - 우하단 모서리를 드래그하면 크기 조절, `+`/`-` 로도 단계 조절
+    내용 모달 3종(파일·대화·차단 사유)이 같은 동작을 공유한다.
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "닫기"),
+        ("q", "dismiss", "닫기"),
+        ("plus,equals_sign", "grow", "크게"),
+        ("minus", "shrink", "작게"),
+    ]
+
+    BOX_ID = "view-box"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._size_step = len(MODAL_SIZE_STEPS) - 1
+        self._resizing = False
+
+    @property
+    def box(self):
+        return self.query_one(f"#{self.BOX_ID}")
+
+    # --- 바깥 클릭으로 닫기 -------------------------------------------------
+    def on_click(self, event) -> None:
+        # `event.widget is self` 로 판정하면 상자 안을 눌러도 닫힌다(실측) —
+        # 자식에서 버블링된 이벤트가 화면에 도달하기 때문. 좌표로 직접 판정한다.
+        if not self.box.region.contains(event.screen_x, event.screen_y):
+            self.dismiss(None)
+
+    # --- 크기 조절 ---------------------------------------------------------
+    def _apply_step(self) -> None:
+        percent = MODAL_SIZE_STEPS[self._size_step]
+        box = self.box
+        box.styles.width = f"{percent}%"
+        box.styles.height = f"{percent}%"
+        self._update_hint()
+
+    def action_grow(self) -> None:
+        self._size_step = min(self._size_step + 1, len(MODAL_SIZE_STEPS) - 1)
+        self._apply_step()
+
+    def action_shrink(self) -> None:
+        self._size_step = max(self._size_step - 1, 0)
+        self._apply_step()
+
+    def _update_hint(self) -> None:
+        self.box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+
+    def on_mouse_down(self, event) -> None:
+        """우하단 모서리 근처에서 누르면 드래그 리사이즈 시작."""
+        box = self.box
+        region = box.region
+        near_corner = (
+            abs(event.screen_x - (region.x + region.width)) <= 2
+            and abs(event.screen_y - (region.y + region.height)) <= 2
+        )
+        if near_corner:
+            self._resizing = True
+            self.capture_mouse()
+            event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._resizing:
+            return
+        box = self.box
+        region = box.region
+        # 커서 위치까지를 새 크기로 (모달은 가운데 정렬이라 좌상단 기준으로 계산)
+        box.styles.width = max(MODAL_MIN_CELLS, event.screen_x - region.x + 1)
+        box.styles.height = max(5, event.screen_y - region.y + 1)
+
+    def on_mouse_up(self, event) -> None:
+        if self._resizing:
+            self._resizing = False
+            self.release_mouse()
+            event.stop()
+
+
+class FileViewModal(ViewModal):
+    """harness 규약 / memory 파일 내용을 읽기 전용으로 보여주는 모달."""
+
+    BOX_ID = "file-view-box"
 
     CSS = """
     FileViewModal {
@@ -189,8 +276,6 @@ class FileViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, path: str) -> None:
         super().__init__()
         self._path = Path(path)
@@ -201,7 +286,7 @@ class FileViewModal(ModalScreen[None]):
 
         box = VerticalScroll(id="file-view-box")
         box.border_title = self._path.name
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
 
         with box:
             with Vertical(id="file-view-head"):
@@ -234,8 +319,10 @@ class FileViewModal(ModalScreen[None]):
         return text
 
 
-class TextViewModal(ModalScreen[None]):
-    """제목 + 본문 텍스트를 읽기 전용으로 보여주는 범용 모달. Escape·q로 닫는다."""
+class TextViewModal(ViewModal):
+    """제목 + 본문 텍스트를 읽기 전용으로 보여주는 범용 모달."""
+
+    BOX_ID = "text-view-box"
 
     CSS = """
     TextViewModal {
@@ -255,8 +342,6 @@ class TextViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, title: str, body: str) -> None:
         super().__init__()
         self._title = title
@@ -265,7 +350,7 @@ class TextViewModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         box = VerticalScroll(id="text-view-box")
         box.border_title = self._title
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
         with box:
             yield Label(escape(self._body))
 
@@ -278,8 +363,10 @@ class MessageListItem(ListItem):
         self.message = message
 
 
-class MessageViewModal(ModalScreen[None]):
-    """대화 한 건의 전문. Escape·q로 닫는다."""
+class MessageViewModal(ViewModal):
+    """대화 한 건의 전문."""
+
+    BOX_ID = "message-view-box"
 
     CSS = """
     MessageViewModal {
@@ -299,8 +386,6 @@ class MessageViewModal(ModalScreen[None]):
     }
     """
 
-    BINDINGS = [("escape", "dismiss", "닫기"), ("q", "dismiss", "닫기")]
-
     def __init__(self, message: ChatMessage) -> None:
         super().__init__()
         self._message = message
@@ -309,7 +394,7 @@ class MessageViewModal(ModalScreen[None]):
         box = VerticalScroll(id="message-view-box")
         speaker = "나" if self._message.role == "user" else "Claude"
         box.border_title = f"{speaker} · {_format_time(self._message.timestamp)}"
-        box.border_subtitle = "esc · q 로 닫기"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
         with box:
             # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
             yield Markdown(self._message.text)
