@@ -526,6 +526,20 @@ class FilterToggle(Static):
         self.app.run_worker(self.app.action_toggle_completed())
 
 
+def _session_signature(sessions: list[SessionSummary]) -> tuple:
+    """화면에 실제로 보이는 것만 추린 비교키.
+
+    dataclass 를 통째로 비교하면 updated_at(float) 이 매 턴 바뀌어 목록을 통째로
+    다시 만든다. 재빌드 순간에 클릭하면 위젯이 사라져 **클릭이 먹히지 않는다**
+    (세션 이동이 가끔 두 번 눌러야 되던 원인). 보이는 값이 같으면 다시 그리지 않는다.
+    """
+    return tuple(
+        (s.session_id, s.title, s.state, s.awaiting_answer, s.question,
+         s.kitty_window_id, s.is_current, _format_time(s.updated_at))
+        for s in sessions
+    )
+
+
 def _hidden_suffix(hidden: int) -> str:
     """숨긴 개수를 제목에 붙인다 — 데이터가 조용히 사라진 것처럼 보이면 안 된다."""
     return f"  [완료 {hidden} 숨김]" if hidden else ""
@@ -735,14 +749,16 @@ class ChecklistPanel(VerticalScroll):
                         continue
                     await listview.append(
                         FileListItem(
-                            Label(f"  [green]✓[/green] [dim strike]{escape(item.text[:50])}[/]"),
+                            # 자르지 않는다 — 항목 대부분이 50자를 넘어 잘리면 뜻이 사라진다
+                            # (실측: 23개 중 18개 초과, 최대 246자). 좁은 패널에선 줄바꿈된다
+                            Label(f"  [green]✓[/green] [dim strike]{escape(item.text)}[/]"),
                             path=checklist.path,
                         )
                     )
                 else:
                     await listview.append(
                         FileListItem(
-                            Label(f"  [dim]☐[/dim] {escape(item.text[:50])}"), path=checklist.path
+                            Label(f"  [dim]☐[/dim] {escape(item.text)}"), path=checklist.path
                         )
                     )
 
@@ -1005,9 +1021,10 @@ class ClaudeMonitorApp(App):
                 )
                 self._last_checklists = snapshot.checklists
 
-            if snapshot.sessions != self._last_sessions:
+            session_signature = _session_signature(snapshot.sessions)
+            if session_signature != self._last_sessions:
                 await self.query_one(SessionPanel).render_sessions(snapshot.sessions)
-                self._last_sessions = snapshot.sessions
+                self._last_sessions = session_signature
                 # 다른 탭에서도 알아채도록 탭바가 읽을 파일을 갱신한다
                 kitty_link.publish_attention_tabs(
                     [s.kitty_window_id for s in snapshot.sessions if s.awaiting_answer]
