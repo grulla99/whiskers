@@ -133,11 +133,6 @@ def read_sessions(
         updated_at = float(entry.get("updated_at") or 0)
         if entry.get("state") == "done" or now - updated_at > STALE_AFTER_SECONDS:
             continue
-        # 창이 없는 세션은 목록에 둘 이유가 없다 — 클릭해도 이동할 데가 없고,
-        # 대개 사용자가 연 적 없는 비대화형 세션이다(워크트리·백그라운드 작업 등)
-        if not entry.get("kitty_window_id"):
-            continue
-
         transcript = next(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"), None)
         title = (
             session_names.get_display_name(session_id)
@@ -163,11 +158,13 @@ def read_sessions(
                 cwd=entry.get("cwd") or "",
                 kitty_window_id=entry.get("kitty_window_id"),
                 is_current=session_id == current_session_id,
+                # 창이 없으면 이동할 수 없다 — 숨기는 대신 어디서 도는지 알려준다
+                detached=not entry.get("kitty_window_id"),
                 awaiting_answer=question is not None,
                 question=question or "",
             )
         )
 
-    # 최근 활동 순 — 지금 뭔가 돌고 있는 세션이 위로 오게
-    summaries.sort(key=lambda s: s.updated_at, reverse=True)
+    # 이동 가능한 세션을 위로, 그 안에서 최근 활동 순 (창 밖 세션은 참고용이라 아래로)
+    summaries.sort(key=lambda s: (s.detached, -s.updated_at))
     return summaries

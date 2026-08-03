@@ -26,10 +26,28 @@ def entry(**kw) -> dict:
 class VisibilityTest(unittest.TestCase):
     """사용자가 열지도 않은 세션이 목록을 더럽히면 안 된다."""
 
-    def test_session_without_window_is_hidden(self):
-        """창이 없으면 클릭해도 갈 데가 없다 — 워크트리·백그라운드 세션이 여기 해당."""
-        path = write_state({"a": entry(kitty_window_id=None)})
-        self.assertEqual(session_list.read_sessions(state_path=path), [])
+    def test_session_without_window_is_marked_detached_not_hidden(self):
+        """창이 없으면 이동은 못 하지만 숨기지 않는다 — 워크트리에서 도는 세션을
+        모르고 지나치는 게 더 나쁘다(사용자 피드백). 대신 detached 로 구분한다."""
+        path = write_state({"a": entry(kitty_window_id=None, cwd="/x/.claude/worktrees/hover-card")})
+        rows = session_list.read_sessions(state_path=path)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].detached)
+
+    def test_windowed_session_is_not_detached(self):
+        path = write_state({"a": entry()})
+        self.assertFalse(session_list.read_sessions(state_path=path)[0].detached)
+
+    def test_detached_sessions_sort_below(self):
+        now = time.time()
+        path = write_state(
+            {
+                "detached": entry(kitty_window_id=None, updated_at=now),  # 더 최근이지만
+                "windowed": entry(updated_at=now - 100),
+            }
+        )
+        rows = session_list.read_sessions(state_path=path)
+        self.assertEqual([r.session_id for r in rows], ["windowed", "detached"])
 
     def test_done_session_is_hidden(self):
         path = write_state({"a": entry(state="done")})

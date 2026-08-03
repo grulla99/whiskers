@@ -139,6 +139,15 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
 
 
 CLICKABLE_CLASS = "clickable"  # 호버 반응은 이 클래스가 붙은 항목에만 준다
+CLICKED_CLASS = "clicked"  # 클릭 순간 잠깐 붙였다 떼는 표시
+CLICK_FLASH_SECONDS = 0.18
+
+
+def flash_clicked(item) -> None:
+    """클릭이 먹었다는 걸 눈으로 알려준다. transition 대신 클래스를 붙였다 떼는 방식 —
+    transition 은 중간 색이 남는 문제가 있었다(tests/test_hover.py 참조)."""
+    item.add_class(CLICKED_CLASS)
+    item.set_timer(CLICK_FLASH_SECONDS, lambda: item.remove_class(CLICKED_CLASS))
 
 
 class FileListItem(ListItem):
@@ -526,6 +535,19 @@ class FilterToggle(Static):
         self.app.run_worker(self.app.action_toggle_completed())
 
 
+def _where_running(cwd: str) -> str:
+    """창 밖 세션이 어디서 도는지 한 줄로 — 워크트리면 그 이름을 집어준다."""
+    if not cwd:
+        return "위치 미상"
+    parts = Path(cwd).parts
+    if "worktrees" in parts:
+        index = parts.index("worktrees")
+        name = parts[index + 1] if index + 1 < len(parts) else "?"
+        repo = parts[index - 1].replace(".claude", "").strip("/.") or Path(cwd).parts[-3]
+        return f"워크트리 {name}"
+    return Path(cwd).name or cwd
+
+
 def _session_signature(sessions: list[SessionSummary]) -> tuple:
     """화면에 실제로 보이는 것만 추린 비교키.
 
@@ -535,7 +557,7 @@ def _session_signature(sessions: list[SessionSummary]) -> tuple:
     """
     return tuple(
         (s.session_id, s.title, s.state, s.awaiting_answer, s.question,
-         s.kitty_window_id, s.is_current, _format_time(s.updated_at))
+         s.kitty_window_id, s.is_current, s.detached, _format_time(s.updated_at))
         for s in sessions
     )
 
@@ -692,6 +714,19 @@ class SessionPanel(VerticalScroll):
             return
 
         for summary in sessions:
+            if summary.detached:
+                # 이동할 창이 없다 — 숨기지 말고 "어디서 도는지"를 알려준다
+                where = _where_running(summary.cwd)
+                await listview.append(
+                    SessionListItem(
+                        Label(
+                            f"[dim]⌁[/dim] [dim]{escape(summary.title)}[/dim]\n"
+                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · 이동 불가[/dim]"
+                        ),
+                        summary=summary,
+                    )
+                )
+                continue
             if summary.awaiting_answer:
                 # "작업중"과 구분되어야 한다 — 이건 내가 답해줘야 진행되는 상태
                 mark, color, label = "❓", "$warning", "답변 대기"
@@ -862,6 +897,13 @@ class ClaudeMonitorApp(App):
     ListItem.clickable:hover > Label {
         background: transparent;
     }
+    /* 클릭 순간 — 호버보다 확실히 진하게 해서 "눌렸다"가 분명히 보이게 */
+    ListItem.clicked {
+        background: $accent 55%;
+    }
+    ListItem.clicked > Label {
+        background: transparent;
+    }
     /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
     SessionListItem.clickable:hover {
         background: $accent 22%;
@@ -954,6 +996,8 @@ class ClaudeMonitorApp(App):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
+        if item is not None and CLICKABLE_CLASS in item.classes:
+            flash_clicked(item)
         if isinstance(item, FileListItem) and item.file_path:
             self.push_screen(FileViewModal(item.file_path))
         elif isinstance(item, MessageListItem):
