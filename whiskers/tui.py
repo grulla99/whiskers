@@ -678,15 +678,24 @@ class SessionPanel(VerticalScroll):
             return
 
         for summary in sessions:
-            mark, color, label = _SESSION_STATE_STYLE.get(
-                summary.state, _SESSION_STATE_STYLE["unknown"]
-            )
+            if summary.awaiting_answer:
+                # "작업중"과 구분되어야 한다 — 이건 내가 답해줘야 진행되는 상태
+                mark, color, label = "❓", "$warning", "답변 대기"
+            else:
+                mark, color, label = _SESSION_STATE_STYLE.get(
+                    summary.state, _SESSION_STATE_STYLE["unknown"]
+                )
             here = " [dim]← 여기[/dim]" if summary.is_current else ""
+            detail = (
+                f"[$warning]{escape(summary.question)}[/]"
+                if summary.awaiting_answer and summary.question
+                else f"[dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+            )
             await listview.append(
                 SessionListItem(
                     Label(
                         f"[{color}]{mark}[/{color}] {escape(summary.title)}{here}\n"
-                        f"   [dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+                        f"   {detail}"
                     ),
                     summary=summary,
                 )

@@ -31,6 +31,53 @@ def _load_states(path: str) -> dict[str, dict]:
     return data if isinstance(data, dict) else {}
 
 
+QUESTION_TAIL_BYTES = 256 * 1024  # 마지막 질문만 보면 되므로 끝부분만 읽는다
+QUESTION_MAX_CHARS = 60
+
+
+def _pending_question(transcript: Path) -> str | None:
+    """답을 기다리는 질문이 있으면 그 내용을 돌려준다.
+
+    "작업중"만으로는 Claude 가 일하는 중인지 **내 답을 기다리는 중**인지 구분이 안 된다.
+    AskUserQuestion 의 tool_use 가 떴는데 대응하는 tool_result 가 아직 없으면 대기 상태다.
+    """
+    try:
+        size = transcript.stat().st_size
+        with transcript.open("rb") as handle:
+            if size > QUESTION_TAIL_BYTES:
+                handle.seek(size - QUESTION_TAIL_BYTES)
+                handle.readline()  # 잘린 첫 줄 버림
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    asked: dict[str, str] = {}  # tool_use_id -> 질문
+    for line in lines:
+        if "AskUserQuestion" not in line and "tool_result" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        content = (record.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
+                questions = (block.get("input") or {}).get("questions") or []
+                first = questions[0].get("question", "") if questions else ""
+                asked[block.get("id", "")] = first
+            elif block.get("type") == "tool_result":
+                asked.pop(block.get("tool_use_id", ""), None)
+
+    if not asked:
+        return None
+    return list(asked.values())[-1][:QUESTION_MAX_CHARS]
+
+
 def _read_ai_title(transcript: Path) -> str | None:
     """가장 마지막 ai-title 레코드를 쓴다 (대화가 진행되며 갱신되므로)."""
     title = None
@@ -70,6 +117,7 @@ def read_sessions(
             or (_read_ai_title(transcript) if transcript else None)
             or session_id[:8]
         )
+        question = _pending_question(transcript) if transcript else None
         summaries.append(
             SessionSummary(
                 session_id=session_id,
@@ -79,6 +127,8 @@ def read_sessions(
                 cwd=entry.get("cwd") or "",
                 kitty_window_id=entry.get("kitty_window_id"),
                 is_current=session_id == current_session_id,
+                awaiting_answer=question is not None,
+                question=question or "",
             )
         )
 

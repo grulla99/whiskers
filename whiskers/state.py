@@ -119,6 +119,8 @@ class SessionSummary:
     cwd: str = ""
     kitty_window_id: str | None = None
     is_current: bool = False
+    awaiting_answer: bool = False  # 질문을 띄워놓고 내 답을 기다리는 중
+    question: str = ""  # 무엇을 묻고 있는지 (한 줄)
 
 
 @dataclass
