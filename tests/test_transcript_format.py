@@ -294,3 +294,66 @@ class CostAccountingTest(unittest.TestCase):
         first = tailer.context_usage().total_input_tokens
         tailer.poll()
         self.assertEqual(tailer.context_usage().total_input_tokens, first, "누적이 두 번 더해졌다")
+
+
+class ContextLimitStickyTest(unittest.TestCase):
+    """압축 뒤에도 한도 판정이 되돌아가지 않아야 한다.
+
+    한도를 "지금 값이 200k 를 넘나"로 판정하면, 압축으로 점유가 뚝 떨어진 순간
+    1M 세션이 200k 세션으로 오판돼 게이지가 19% 대신 **97%** 로 뛴다 (실측 버그).
+    """
+
+    @staticmethod
+    def usage(total: int, timestamp: str) -> dict:
+        return {
+            "type": "assistant",
+            "timestamp": timestamp,
+            "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "."}],
+                "usage": {"input_tokens": 2, "cache_read_input_tokens": total - 2, "output_tokens": 1},
+            },
+        }
+
+    @staticmethod
+    def boundary_record(pre: int, post: int, timestamp: str) -> dict:
+        return {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "timestamp": timestamp,
+            "uuid": f"b-{timestamp}",
+            "compactMetadata": {
+                "trigger": "auto", "preTokens": pre, "postTokens": post, "durationMs": 1,
+                "preservedMessages": {"uuids": []},
+            },
+        }
+
+    def test_limit_stays_1m_after_compaction_drops_below_200k(self):
+        records = [
+            self.usage(900_000, "2026-08-03T01:00:00.000Z"),
+            self.boundary_record(900_000, 15_000, "2026-08-03T01:01:00.000Z"),
+            self.usage(195_000, "2026-08-03T01:02:00.000Z"),  # 압축 후 — 200k 밑
+        ]
+        tailer = TranscriptTailer(str(write_jsonl(records)))
+        tailer.poll()
+        usage = tailer.context_usage()
+        self.assertEqual(usage.limit, 1_000_000, "압축으로 값이 내려가자 200k 세션으로 오판했다")
+        self.assertAlmostEqual(usage.ratio, 0.195, places=3)
+
+    def test_compaction_pretokens_alone_proves_a_long_window(self):
+        """관측된 요청이 전부 200k 밑이어도, preTokens 가 크면 1M 세션이다 (실측 1,000,122)."""
+        records = [
+            self.boundary_record(1_000_122, 12_000, "2026-08-03T01:00:00.000Z"),
+            self.usage(122_000, "2026-08-03T01:01:00.000Z"),
+        ]
+        tailer = TranscriptTailer(str(write_jsonl(records)))
+        tailer.poll()
+        self.assertEqual(tailer.context_usage().limit, 1_000_000)
+
+    def test_small_session_still_reads_as_200k(self):
+        records = [self.usage(90_000, "2026-08-03T01:00:00.000Z")]
+        tailer = TranscriptTailer(str(write_jsonl(records)))
+        tailer.poll()
+        usage = tailer.context_usage()
+        self.assertEqual(usage.limit, 200_000)
+        self.assertAlmostEqual(usage.ratio, 0.45, places=2)

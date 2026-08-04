@@ -100,6 +100,8 @@ class TranscriptTailer:
         self._context: ContextUsage | None = None
         self._total_input_tokens = 0
         self._total_new_tokens = 0
+        # 컨텍스트 한도 판정용 최대치 — 압축으로 값이 내려가도 되돌아가지 않는다
+        self._peak_input_tokens = 0
         self._hook_blocks: list[HookBlock] = []
         self._compactions: list[Compaction] = []
         self._touched_dirs: dict[str, int] = {}  # 디렉토리 -> 마지막으로 건드린 순번
@@ -134,6 +136,12 @@ class TranscriptTailer:
         return existing[:limit]
 
     def context_usage(self) -> ContextUsage | None:
+        if self._context is None:
+            return None
+        # 한도는 "지금 값"이 아니라 **세션에서 본 최대치**로 판정한다. 압축 직후엔 점유가
+        # 뚝 떨어지므로 현재값만 보면 1M 세션을 200k 세션으로 오판하고, 게이지가 19% 대신
+        # 97% 로 뛰어 거짓 경고가 된다 (실측: 압축으로 195k 가 된 세션이 97% 로 표시됨).
+        self._context.limit = _context_limit(self._context.model, self._peak_input_tokens)
         return self._context
 
     def poll(self) -> list[AgentEvent]:
@@ -282,6 +290,7 @@ class TranscriptTailer:
         # tail 은 증분으로만 읽으니 같은 레코드를 두 번 더하지 않는다.
         self._total_input_tokens += input_tokens
         self._total_new_tokens += sum(int(usage.get(key) or 0) for key in _NEW_TOKEN_KEYS)
+        self._peak_input_tokens = max(self._peak_input_tokens, input_tokens)
         model = message.get("model") or ""
         self._context = ContextUsage(
             model=model,
@@ -313,6 +322,9 @@ class TranscriptTailer:
             cumulative_dropped_tokens=metadata.get("cumulativeDroppedTokens"),
             message_index=len(self._messages),
         )
+        # 압축 전 점유(preTokens)는 그 세션이 얼마나 큰 창을 쓰는지 알려주는 직접 증거다
+        # (실측: preTokens 1,000,122 → 1M 창 확정)
+        self._peak_input_tokens = max(self._peak_input_tokens, compaction.pre_tokens)
 
         for message in self._messages:
             preserved = bool(message.uuid) and message.uuid in preserved_uuids
