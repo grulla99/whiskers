@@ -1195,7 +1195,10 @@ class SessionPanel(VerticalScroll):
             return
 
         for summary in sessions:
-            if summary.detached:
+            # detached 판정보다 is_current 를 먼저 본다. 지금 이 패널이 보고 있는 세션인데
+            # "이 창 밖에서 실행 중"이라고 적으면 앞뒤가 안 맞는다 — 백그라운드 세션은
+            # 창 정보가 없어 항상 detached 로 잡히므로, 고정해서 보고 있어도 그렇게 나왔다.
+            if summary.detached and not summary.is_current:
                 # 이동할 창이 없다 — 숨기지 말고 "어디서 도는지"를 알려준다
                 where = _where_running(summary.cwd)
                 await listview.append(
@@ -1216,7 +1219,11 @@ class SessionPanel(VerticalScroll):
                 mark, color, label = _SESSION_STATE_STYLE.get(
                     summary.state, _SESSION_STATE_STYLE["unknown"]
                 )
-            here = " [dim]← 여기[/dim]" if summary.is_current else ""
+            # 창이 없는데도 보고 있다면 고정해서 보고 있다는 뜻이다 — 그렇게 표시한다
+            if summary.is_current:
+                here = " [dim]← 📌 고정[/dim]" if summary.detached else " [dim]← 여기[/dim]"
+            else:
+                here = ""
             detail = (
                 f"[$warning]{escape(summary.question)}[/]"
                 if summary.awaiting_answer and summary.question

@@ -158,3 +158,48 @@ class SwitchWiringTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertFalse(any("옛 세션" in t for t in texts), f"옛 세션 대화가 남았다: {texts}")
             self.assertEqual(len(texts), 3, texts)
+
+
+class CurrentSessionLabelTest(unittest.IsolatedAsyncioTestCase):
+    """지금 보고 있는 세션을 "이 창 밖에서 실행 중"이라고 적으면 앞뒤가 안 맞는다.
+
+    백그라운드 세션은 창 정보가 없어 항상 detached 로 잡히므로, 고정해서 보고 있는데도
+    "창 밖 · 클릭하면 고정"으로 나왔다 — 이미 고정해서 보고 있는 세션인데.
+    """
+
+    async def _render(self, **kw):
+        import time as _time
+        from whiskers import tui as T
+        from whiskers.collector import Collector
+        from whiskers.state import SessionInfo, SessionSummary
+        from textual.widgets import Label
+
+        app = T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"))
+        )
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            panel = app.query_one(T.SessionPanel)
+            await panel.render_sessions([
+                SessionSummary(session_id="a", title="클로드모니터", state="running",
+                               updated_at=_time.time(), **kw)
+            ])
+            await pilot.pause()
+            item = next(c for c in panel.query_one("ListView").children
+                        if isinstance(c, T.SessionListItem))
+            return str(item.query_one(Label).render())
+
+    async def test_pinned_current_session_is_not_called_outside_this_window(self):
+        text = await self._render(detached=True, is_current=True)
+        self.assertNotIn("이 창 밖에서 실행 중", text)
+        self.assertIn("📌 고정", text)
+
+    async def test_other_detached_session_still_offers_pinning(self):
+        text = await self._render(detached=True, is_current=False)
+        self.assertIn("이 창 밖에서 실행 중", text)
+        self.assertIn("클릭하면 이 패널에 고정", text)
+
+    async def test_windowed_current_session_reads_as_here(self):
+        text = await self._render(kitty_window_id="3", is_current=True)
+        self.assertIn("← 여기", text)
+        self.assertNotIn("📌", text)
