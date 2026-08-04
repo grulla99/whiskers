@@ -306,7 +306,11 @@ class ChatPanelCompactionTest(unittest.IsolatedAsyncioTestCase):
             app._activate(divider)
             await pilot.pause()
             self.assertIsInstance(app.screen, T.CompactionViewModal)
-            body = app.screen.query_one("#compaction-view-body").source
+
+            await pilot.click(app.screen.query_one(T.CompactionSummaryBar))
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, T.CompactionSummaryModal)
+            body = app.screen.query_one("#compaction-summary-body").source
             self.assertIn("continued from a previous conversation", body)
 
     async def test_refresh_notices_in_place_state_changes(self):
@@ -400,6 +404,102 @@ class ChatPanelCompactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, T.CompactionHistoryModal)
             body = str(app.screen.query_one("#compaction-history-empty", Label).render())
             self.assertIn("아직 압축되지 않았습니다", body)
+
+    @staticmethod
+    def _table_rows(screen) -> list[list[str]]:
+        table = screen.query_one("#compaction-messages", T.DataTable)
+        return [[str(cell) for cell in table.get_row_at(i)] for i in range(table.row_count)]
+
+    async def test_detail_lists_both_sides_and_opens_full_text(self):
+        """무엇이 사라지고 무엇이 남았는지 **건별로** 보이고, 클릭하면 전문까지 읽혀야 한다."""
+        gone = make_message("사라진 긴 발화\n" + "본문 " * 200, dropped=True)
+        kept = make_message("남은 발화", survived=True)
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app.push_screen(T.CompactionViewModal(make_compaction(2, [gone], [kept])))
+            await pilot.pause()
+
+            rows = self._table_rows(app.screen)
+            self.assertEqual([row[0] for row in rows], ["⌫", "⏺"], "사라진 것 먼저, 남은 것 다음")
+            self.assertEqual([row[2] for row in rows], ["나", "나"])
+            self.assertIn("사라진 긴 발화", rows[0][3])
+            self.assertTrue(rows[0][3].endswith("…"), "잘린 발화는 더 있다는 표시가 있어야 한다")
+            self.assertIn("남은 발화", rows[1][3])
+            # 건수는 헤더 통계가 아니라 요약 줄 위 통계에서 읽히므로 제목으로 확인한다
+            self.assertIn("컨텍스트 압축", app.screen.query_one("#compaction-view-box").border_title)
+
+            table = app.screen.query_one("#compaction-messages", T.DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("enter")  # 사라진 발화 선택 → 전문
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, T.MessageViewModal)
+            self.assertEqual(app.screen.query_one("#message-view-body").source, gone.text)
+
+            await pilot.press("escape")  # 전문을 닫으면 압축 상세로 돌아온다
+            await pilot.pause()
+            self.assertIsInstance(app.screen, T.CompactionViewModal)
+
+    async def test_translation_hint_survives_nested_opening(self):
+        """다른 모달 안에서 띄우면 안내 문구를 마운트 뒤에 고치는 방식이 실패한다.
+
+        on_mount 가 compose 보다 먼저 돌거나(힌트가 기본 문구에 덮임),
+        `call_after_refresh` 가 다음 갱신까지 미뤄져 아예 안 붙었다 — 둘 다 실측.
+        """
+        english = make_compaction(1, [], [])
+        english.summary = "This session is being continued from a previous conversation. " * 40
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app.push_screen(T.CompactionViewModal(english))  # 1단
+            await pilot.pause()
+            await pilot.click(app.screen.query_one(T.CompactionSummaryBar))  # 2단
+            await pilot.pause(0.3)
+
+            self.assertIsInstance(app.screen, T.CompactionSummaryModal)
+            self.assertIn(
+                "t 한국어",
+                app.screen.query_one("#compaction-summary-box").border_subtitle,
+                "영어 요약인데 번역 안내가 안 붙었다",
+            )
+
+    async def test_mouse_click_opens_a_row(self):
+        """기본 DataTable 은 클릭으로 커서만 옮기고 선택 이벤트를 안 보낸다 — 마우스로도 열려야 한다."""
+        gone = make_message("사라진 발화", dropped=True)
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app.push_screen(T.CompactionViewModal(make_compaction(1, [gone], [])))
+            await pilot.pause()
+
+            table = app.screen.query_one("#compaction-messages", T.DataTable)
+            await pilot.click(table, offset=(20, 1))  # 헤더 아래 첫 데이터 행
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, T.MessageViewModal)
+            self.assertEqual(app.screen.query_one("#message-view-body").source, gone.text)
+
+    async def test_clicking_the_header_selects_nothing(self):
+        gone = make_message("사라진 발화", dropped=True)
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app.push_screen(T.CompactionViewModal(make_compaction(1, [gone], [])))
+            await pilot.pause()
+
+            table = app.screen.query_one("#compaction-messages", T.DataTable)
+            await pilot.click(table, offset=(20, 0))  # 헤더 줄
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, T.CompactionViewModal, "헤더 클릭에 행이 열렸다")
+
+    async def test_over_limit_is_announced_not_silently_cut(self):
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            many = [make_message(f"발화 {i}", dropped=True) for i in range(T.COMPACTION_LIST_MAX + 5)]
+            app.push_screen(T.CompactionViewModal(make_compaction(len(many), many, [])))
+            await pilot.pause()
+            contents = [row[3] for row in self._table_rows(app.screen)]
+            self.assertTrue(any("외 5건" in c for c in contents), "상한을 넘긴 걸 말해주지 않는다")
 
     async def test_older_compactions_show_the_date(self):
         """며칠에 걸친 세션에서 시:분만 쓰면 순서가 뒤집혀 보인다 (07-31 11:44 vs 08-03 11:04)."""

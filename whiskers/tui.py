@@ -23,6 +23,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
@@ -243,8 +244,8 @@ class ViewModal(ModalScreen[None]):
         self._update_hint()
 
     def on_mount(self) -> None:
-        # compose 에서 border_subtitle 을 직접 넣기 때문에, 원문이 정해진 뒤 한 번 다시 그려야
-        # 번역 힌트([t 한국어])가 붙는다
+        # 안전망이다 — 정식 경로는 각 모달의 compose 에서 `_hint_text()` 를 쓰는 것.
+        # compose 에서 빠뜨려도 여기서 채워지지만, 순서가 보장되지 않으니 의존하지 말 것.
         self._update_hint()
 
     @property
@@ -274,12 +275,24 @@ class ViewModal(ModalScreen[None]):
         self._size_step = max(self._size_step - 1, 0)
         self._apply_step()
 
-    def _update_hint(self) -> None:
+    def _hint_text(self) -> str:
+        """테두리 아래에 띄울 조작 안내. 상자가 아직 안 붙어 있어도 계산된다.
+
+        compose 에서 바로 쓸 수 있어야 한다 — 마운트 뒤에 고치는 방식은 경로에 따라
+        순서가 뒤집혀 실패했다(다른 모달 안에서 띄우면 on_mount 가 compose 보다 먼저
+        돌고, `call_after_refresh` 는 다음 갱신이 올 때까지 미뤄진다. 둘 다 실측).
+        """
         translation = ""
         if self.BODY_ID and translate.looks_english(self._original_body):
             # 대괄호는 rich 마크업으로 해석돼 화면에 백슬래시가 노출된다 — 가운뎃점을 쓴다
             translation = "  ·  t 원문" if self._showing_translation else "  ·  t 한국어"
-        self.box.border_subtitle = f"esc·q 닫기  +/- 크기  ⇘ 드래그{translation}"
+        return f"esc·q 닫기  +/- 크기  ⇘ 드래그{translation}"
+
+    def _update_hint(self) -> None:
+        try:
+            self.box.border_subtitle = self._hint_text()
+        except NoMatches:
+            pass  # 상자가 아직 안 붙었거나 이미 닫힌 모달 — 힌트는 부가 정보다
 
     def on_mouse_down(self, event) -> None:
         """우하단 모서리 근처에서 누르면 드래그 리사이즈 시작."""
@@ -361,10 +374,11 @@ class FileViewModal(ViewModal):
     def compose(self) -> ComposeResult:
         raw = self._read_text()
         meta, body = _parse_frontmatter(raw)
+        self._original_body = body.strip()  # 안내 문구(번역 여부)가 본문에 달려 있다
 
         box = VerticalScroll(id="file-view-box")
         box.border_title = self._path.name
-        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        box.border_subtitle = self._hint_text()
 
         with box:
             with Vertical(id="file-view-head"):
@@ -373,7 +387,6 @@ class FileViewModal(ViewModal):
                     yield Label(escape(meta["description"]), id="file-view-desc")
                 if meta_line := self._format_meta(meta):
                     yield Label(meta_line, id="file-view-meta")
-            self._original_body = body.strip()
             yield Markdown(self._original_body, id="file-view-body")
 
     @staticmethod
@@ -429,7 +442,7 @@ class TextViewModal(ViewModal):
     def compose(self) -> ComposeResult:
         box = VerticalScroll(id="text-view-box")
         box.border_title = self._title
-        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        box.border_subtitle = self._hint_text()
         with box:
             yield Label(escape(self._body))
 
@@ -471,13 +484,13 @@ class MessageViewModal(ViewModal):
         self._message = message
 
     def compose(self) -> ComposeResult:
+        # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
+        self._original_body = self._message.text
         box = VerticalScroll(id="message-view-box")
         speaker = "나" if self._message.role == "user" else "Claude"
         box.border_title = f"{speaker} · {_format_time(self._message.timestamp)}"
-        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        box.border_subtitle = self._hint_text()
         with box:
-            # 대화 본문은 마크다운인 경우가 많아 그대로 렌더하면 훨씬 읽기 쉽다
-            self._original_body = self._message.text
             yield Markdown(self._original_body, id="message-view-body")
 
 
@@ -513,14 +526,97 @@ def _compaction_divider(compaction: Compaction) -> str:
     )
 
 
-COMPACTION_LIST_MAX = 80  # 모달에 나열할 대화 건수 상한 (넘으면 "외 N건"으로 알린다)
+# 모달에 나열할 대화 건수 상한. 클릭 가능한 목록으로 바뀌면서 한 줄 Label 뭉치보다
+# 여유가 생겼으므로 넉넉히 둔다 (대화 로그 패널이 482항목을 문제없이 그린다).
+COMPACTION_LIST_MAX = 1000
+
+
+class ClickableDataTable(DataTable):
+    """클릭 한 번으로 행이 선택되는 표.
+
+    기본 DataTable 은 클릭을 받으면 **커서만 옮기고** `RowSelected` 를 보내지 않는다 —
+    Enter 를 눌러야 선택된다. 게다가 Click 이벤트를 여기서 멈춰서 화면 쪽에서 잡을 수도
+    없다(둘 다 실측). 이 모니터는 마우스로 쓰는 게 전제라 직접 보낸다.
+    """
+
+    def on_click(self, event) -> None:
+        # 프레임워크의 `_on_click` 이 먼저 돌아 커서를 옮긴 뒤 이 핸들러가 실행된다
+        if self.show_header and event.y == 0:
+            return  # 헤더 클릭은 선택이 아니다
+        row_keys = list(self.rows)
+        if 0 <= self.cursor_row < len(row_keys):
+            self.post_message(self.RowSelected(self, self.cursor_row, row_keys[self.cursor_row]))
+
+
+class CompactionSummaryBar(Static):
+    """요약 전문으로 들어가는 줄. 압축 상세 맨 위에 붙는다."""
+
+    def __init__(self, compaction: Compaction) -> None:
+        super().__init__(id="compaction-summary-bar")
+        self._compaction = compaction
+        self.update(
+            f"[bold]📄 요약 전문[/bold] [dim]({len(compaction.summary):,}자)"
+            "  — 아래 대화들을 대신해 컨텍스트에 남은 내용. 클릭하면 열림[/dim]"
+        )
+
+    def on_click(self, event) -> None:
+        # 막지 않으면 모달의 "바깥 클릭 = 닫기" 판정까지 이벤트가 올라간다
+        event.stop()
+        flash_clicked(self)
+        self.set_timer(
+            CLICK_ACTION_DELAY,
+            lambda: self.app.push_screen(CompactionSummaryModal(self._compaction)),
+        )
+
+
+class CompactionSummaryModal(ViewModal):
+    """압축 요약 전문 — 사라진 대화들을 대신해 컨텍스트에 남은 내용."""
+
+    BOX_ID = "compaction-summary-box"
+    BODY_ID = "compaction-summary-body"
+
+    CSS = """
+    CompactionSummaryModal {
+        align: center middle;
+        background: $background 70%;
+    }
+    #compaction-summary-box {
+        width: 96%;
+        height: 92%;
+        border: round $error;
+        background: $surface;
+        border-title-color: $text;
+        border-title-background: $error-darken-2;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        padding: 1 2;
+    }
+    """
+
+    def __init__(self, compaction: Compaction) -> None:
+        super().__init__()
+        self._compaction = compaction
+        # compose 가 아니라 여기서 정한다 — 번역 힌트를 붙이는 on_mount 가 compose 보다
+        # 먼저 돌 수 있어서, compose 에서 대입하면 힌트가 안 붙는다(실측).
+        # 한국어 제목은 본문에 섞지 않는다: 영어 판정(looks_english)이 흐려지고
+        # 번역할 때 제목까지 함께 넘어간다.
+        self._original_body = (
+            compaction.summary
+            or "*요약 레코드를 찾지 못했습니다 (기록이 아직 쓰이는 중일 수 있음).*"
+        )
+
+    def compose(self) -> ComposeResult:
+        box = VerticalScroll(id="compaction-summary-box")
+        box.border_title = f"요약 전문 · 압축 {_format_when(self._compaction.timestamp)}"
+        box.border_subtitle = self._hint_text()
+        with box:
+            yield Markdown(self._original_body, id="compaction-summary-body")
 
 
 class CompactionViewModal(ViewModal):
-    """압축 한 건의 전모 — 무엇이 사라졌고, 무엇이 남았고, 요약은 뭐라고 적혔는지."""
+    """압축 한 건의 전모 — 무엇이 사라졌고, 무엇이 남았는지 건별로."""
 
     BOX_ID = "compaction-view-box"
-    BODY_ID = "compaction-view-body"
 
     CSS = """
     CompactionViewModal {
@@ -539,59 +635,90 @@ class CompactionViewModal(ViewModal):
         padding: 0;
     }
     #compaction-head {
+        height: auto;
         background: $panel;
         padding: 1 2;
         border-bottom: solid $error-darken-2;
     }
-    #compaction-stats { padding-bottom: 1; }
-    #compaction-dropped { color: $text-muted; }
-    #compaction-preserved { color: $text-muted; padding-top: 1; }
-    #compaction-summary-heading { padding-top: 1; }
-    #compaction-view-body { padding: 1 2; }
+    #compaction-summary-bar {
+        height: auto;
+        padding: 0 2;
+        background: $panel;
+        border-bottom: solid $error-darken-2;
+    }
+    #compaction-summary-bar:hover {
+        background: $primary 25%;
+        color: $text;
+    }
+    #compaction-summary-bar.clicked {
+        background: $accent 85%;
+    }
+    #compaction-messages { height: 1fr; }
     """
+
+    CONTENT_WIDTH = 64  # 내용 열 폭 — 좁은 분할 패널에서 가로 스크롤이 안 생기게
 
     def __init__(self, compaction: Compaction) -> None:
         super().__init__()
         self._compaction = compaction
+        self._by_row: dict[str, ChatMessage] = {}
 
     def compose(self) -> ComposeResult:
         compaction = self._compaction
-        box = VerticalScroll(id="compaction-view-box")
+        box = Vertical(id="compaction-view-box")
         box.border_title = (
             f"컨텍스트 압축 · {_trigger_label(compaction.trigger)} · "
             f"{_format_when(compaction.timestamp)}"
         )
-        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        box.border_subtitle = self._hint_text()
 
         with box:
             with Vertical(id="compaction-head"):
                 yield Label(self._stats_text(), id="compaction-stats")
-                yield Label(
-                    self._message_block(
-                        f"[$error]⌫ 요약으로 대체된 대화 {len(compaction.dropped_messages)}건[/]"
-                        "  [dim]— 원문은 모델 컨텍스트에서 사라졌다[/dim]",
-                        compaction.dropped_messages,
-                    ),
-                    id="compaction-dropped",
-                )
-                yield Label(
-                    self._message_block(
-                        f"[$success]⏺ 원문으로 남은 대화 {len(compaction.preserved_messages)}건[/]",
-                        compaction.preserved_messages,
-                    ),
-                    id="compaction-preserved",
-                )
-                yield Label(
-                    "[bold]요약 전문[/bold]  [dim]— 위 대화들을 대신해 컨텍스트에 남은 내용[/dim]",
-                    id="compaction-summary-heading",
-                )
-            # 제목은 본문에 섞지 않는다 — 한국어 제목이 끼면 번역 버튼 노출 판정
-            # (translate.looks_english)이 흐려지고, 번역할 때도 제목까지 함께 넘어간다
-            self._original_body = (
-                compaction.summary
-                or "*요약 레코드를 찾지 못했습니다 (기록이 아직 쓰이는 중일 수 있음).*"
+            yield CompactionSummaryBar(compaction)
+
+            # 한 줄 미리보기만 주면 "무엇이 사라졌나"에 답이 안 된다 — 행을 클릭해 전문을
+            # 읽을 수 있게 한다. 위젯 목록(ListView)이 아니라 표를 쓰는 이유는 속도다:
+            # 460건에서 ListView 880ms vs DataTable 116ms (실측). 여는 데 1초를 쓰면
+            # "보기 불편"이 그대로 남는다.
+            table = ClickableDataTable(
+                id="compaction-messages", cursor_type="row", zebra_stripes=True
             )
-            yield Markdown(self._original_body, id="compaction-view-body")
+            table.add_column("", width=2)
+            table.add_column("시각", width=11)
+            table.add_column("화자", width=6)
+            table.add_column("내용 (클릭하면 전문)", width=self.CONTENT_WIDTH)
+            yield table
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        table = self.query_one(DataTable)
+        for mark, style, messages in (
+            ("⌫", "$error", self._compaction.dropped_messages),
+            ("⏺", "$success", self._compaction.preserved_messages),
+        ):
+            for message in messages[:COMPACTION_LIST_MAX]:
+                key = str(len(self._by_row))
+                self._by_row[key] = message
+                table.add_row(
+                    Text(mark, style=style),
+                    _format_when(message.timestamp),
+                    "나" if message.role == "user" else "Claude",
+                    _one_line(message.text, self.CONTENT_WIDTH),
+                    key=key,
+                )
+            if len(messages) > COMPACTION_LIST_MAX:
+                # 조용히 자르지 않는다 — 다 본 것처럼 착각하면 안 된다
+                table.add_row(
+                    "", "", "", f"… 외 {len(messages) - COMPACTION_LIST_MAX}건 (표시 상한)"
+                )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """마우스 클릭과 Enter 가 모두 여기로 온다 (ClickableDataTable 참조)."""
+        event.stop()  # 앱 레벨 핸들러까지 올라가면 처리가 겹친다
+        message = self._by_row.get(event.row_key.value)
+        if message is not None:
+            self.app.push_screen(MessageViewModal(message))
 
     def _stats_text(self) -> str:
         compaction = self._compaction
@@ -604,21 +731,6 @@ class CompactionViewModal(ViewModal):
             # 세션 누적값이라 이번 한 건의 양과 다를 수 있어 따로 표기한다
             parts.append(f"[dim]세션 누적 버림 {compaction.cumulative_dropped_tokens:,}[/dim]")
         return "  ·  ".join(parts)
-
-    @staticmethod
-    def _message_block(heading: str, messages: list[ChatMessage]) -> str:
-        if not messages:
-            return f"{heading}\n   [dim](없음)[/dim]"
-        lines = [heading]
-        for message in messages[:COMPACTION_LIST_MAX]:
-            speaker = "나" if message.role == "user" else "Claude"
-            lines.append(
-                f"   [dim]{_format_time(message.timestamp)}[/dim] "
-                f"[bold]{speaker}[/bold] {escape(_one_line(message.text))}"
-            )
-        if len(messages) > COMPACTION_LIST_MAX:
-            lines.append(f"   [dim]… 외 {len(messages) - COMPACTION_LIST_MAX}건[/dim]")
-        return "\n".join(lines)
 
 
 class CompactionHistoryListItem(ListItem):
@@ -661,7 +773,7 @@ class CompactionHistoryModal(ViewModal):
     def compose(self) -> ComposeResult:
         box = VerticalScroll(id="compaction-history-box")
         box.border_title = f"컨텍스트 압축 이력 · {len(self._compactions)}회"
-        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+        box.border_subtitle = self._hint_text()
 
         with box:
             if not self._compactions:
