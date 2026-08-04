@@ -133,6 +133,26 @@ def _short_total(tokens: int) -> str:
     return f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
 
 
+STALE_AFTER_SECONDS = 600  # 10분 — 프롬프트 사이 공백과 "끝난 세션"을 가르는 선
+
+
+def _idle_marker(last_activity_at: float, now: float) -> str:
+    """마지막 활동이 오래됐으면 맨 앞에 붙인다.
+
+    패널은 자기 탭 창에 심긴 세션을 보여주는데, 그 세션이 끝난 뒤에도 계속 붙들고 있다
+    (백그라운드 세션은 창이 없어 탭을 갱신하지 못한다). 실측: 69분 전에 멈춘 세션이
+    현재처럼 보여 "지금 내 대화"로 오인됐고, 그 세션의 85% 를 자기 값으로 읽었다.
+    """
+    if not last_activity_at:
+        return ""
+    idle_minutes = int((now - last_activity_at) // 60)
+    if (now - last_activity_at) < STALE_AFTER_SECONDS:
+        return ""
+    if idle_minutes < 60:
+        return f"⏸ 멈춤 {idle_minutes}분"
+    return f"⏸ 멈춤 {idle_minutes // 60}시간 {idle_minutes % 60}분"
+
+
 def _cost_warning(context: ContextUsage | None) -> tuple[str, str]:
     """(헤더 앞에 붙일 경고 문구, Header 에 줄 CSS 클래스).
 
@@ -1386,6 +1406,11 @@ class ClaudeMonitorApp(App):
     Header.-cost-danger {
         background: $error 55%;
     }
+    /* 멈춘 세션은 색을 빼고 흐리게 — 지금 값이 아니라는 걸 색으로도 알린다 */
+    Header.-idle {
+        background: $panel;
+        color: $text-muted;
+    }
     Footer {
         background: $panel;
     }
@@ -1469,7 +1494,10 @@ class ClaudeMonitorApp(App):
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
 
     def _update_title(
-        self, context: ContextUsage | None = None, compactions: list[Compaction] | None = None
+        self,
+        context: ContextUsage | None = None,
+        compactions: list[Compaction] | None = None,
+        last_activity_at: float = 0.0,
     ) -> None:
         session = self._collector.session
         self.title = session.display_name or session.session_id
@@ -1477,11 +1505,14 @@ class ClaudeMonitorApp(App):
         # 이미 몇 번 버려진 뒤인지가 같이 보여야 한다
         compacted = f"압축 {len(compactions)}회 · " if compactions else ""
 
-        # 요청당 비용 경고를 맨 앞에 — 게이지 숫자만으로는 "이게 사용량"이라는 게 안 읽힌다
+        # 요청당 비용 경고와 멈춤 표시를 맨 앞에 — 게이지 숫자만으로는 "이게 사용량"이라는
+        # 것도, "이게 지금 값이 아니라는" 것도 읽히지 않는다
         warning, warning_class = _cost_warning(context)
         for name in ("-cost-caution", "-cost-danger"):
             self.query_one(Header).set_class(name == warning_class, name)
-        prefix = f"{warning} · " if warning else ""
+        idle = _idle_marker(last_activity_at, datetime.now().timestamp())
+        self.query_one(Header).set_class(bool(idle), "-idle")
+        prefix = "".join(f"{part} · " for part in (idle, warning) if part)
 
         # 컨텍스트 사용률을 헤더에 상주시킨다 — performance.md 의 "마지막 20% 회피"를
         # 눈으로 확인할 수 있어야 지켜진다
@@ -1564,7 +1595,7 @@ class ClaudeMonitorApp(App):
         self._refreshing = True
         try:
             snapshot = self._collector.snapshot()
-            self._update_title(snapshot.context, snapshot.compactions)
+            self._update_title(snapshot.context, snapshot.compactions, snapshot.last_activity_at)
 
             # 압축이 일어나면 이미 있던 ChatMessage 의 표시 상태만 **제자리에서** 바뀐다.
             # 같은 객체를 들고 비교하므로 목록 비교로는 그 변화를 못 잡는다 — 압축 이력도 함께 본다.

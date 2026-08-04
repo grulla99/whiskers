@@ -120,6 +120,14 @@ class Collector:
         snap.context = self._transcript_tailer.context_usage()
         snap.hook_blocks = self._transcript_tailer.hook_blocks()
         snap.compactions = self._transcript_tailer.compactions()
+        # 파일 mtime 은 내용이 안 바뀌어도 갱신될 때가 있어 활동 신호로 쓰지 않는다
+        # (실측: 어제 끝난 세션의 mtime 이 5분 전으로 찍혔다). 레코드 타임스탬프를 쓴다.
+        snap.last_activity_at = self._transcript_tailer.last_record_at()
+        if not snap.last_activity_at:
+            try:
+                snap.last_activity_at = Path(self.session.transcript_path).stat().st_mtime
+            except OSError:
+                pass
 
         # 소스 하나가 예상 못한 이유로 실패해도(권한 오류, 손상된 markdown 등)
         # 나머지 패널은 계속 그려야 하므로 개별적으로 격리한다.

@@ -180,3 +180,6 @@ class Snapshot:
     compactions: list[Compaction] = field(default_factory=list)
     context: ContextUsage | None = None
     generated_at: float = 0.0
+    # 이 세션의 마지막 기록 시각(transcript mtime). 패널이 끝난 세션을 계속 붙들고
+    # 있을 수 있어, 지금 값인지 옛 값인지 구분하려면 필요하다.
+    last_activity_at: float = 0.0

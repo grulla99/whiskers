@@ -579,3 +579,54 @@ class CostWarningTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertNotIn("-cost-danger", header.classes, "정상 세션인데 경고색이 남았다")
             self.assertNotIn("-cost-caution", header.classes)
+
+
+class IdleMarkerTest(unittest.TestCase):
+    """패널은 자기 탭 창에 심긴 세션을 계속 붙들고 있다 — 지금 값인지 표시해야 한다."""
+
+    def test_recent_activity_shows_nothing(self):
+        now = time.time()
+        self.assertEqual(T._idle_marker(now - 30, now), "")
+
+    def test_stale_session_is_marked_with_elapsed_time(self):
+        now = time.time()
+        self.assertEqual(T._idle_marker(now - 25 * 60, now), "⏸ 멈춤 25분")
+        self.assertEqual(T._idle_marker(now - (25 * 3600 + 13 * 60), now), "⏸ 멈춤 25시간 13분")
+
+    def test_unknown_activity_shows_nothing(self):
+        self.assertEqual(T._idle_marker(0.0, time.time()), "")
+
+
+class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
+    """멈춤 표시가 실제로 헤더까지 도달하는지 — 헬퍼만 맞아도 배선이 빠지면 무용지물이다."""
+
+    def test_collector_reports_record_time_not_mtime(self):
+        import os
+        from whiskers.collector import Collector as RealCollector
+
+        stale = write_jsonl([user("옛 발화", timestamp="2026-08-03T04:53:57.140Z", uuid="u1")])
+        os.utime(stale, None)  # mtime 만 지금으로
+        collector = RealCollector(
+            SessionInfo(session_id="x", transcript_path=str(stale), cwd="/tmp")
+        )
+        snapshot = collector.snapshot()
+        self.assertGreater(
+            time.time() - snapshot.last_activity_at, 3600, "mtime 을 활동 시각으로 썼다"
+        )
+
+    async def test_stale_session_marks_the_header(self):
+        from textual.widgets import Header
+
+        app = T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"))
+        )
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app._update_title(None, [], time.time() - 25 * 3600)
+            await pilot.pause()
+            self.assertTrue(app.sub_title.startswith("⏸ 멈춤 25시간"), app.sub_title)
+            self.assertIn("-idle", app.query_one(Header).classes)
+
+            app._update_title(None, [], time.time())
+            await pilot.pause()
+            self.assertNotIn("-idle", app.query_one(Header).classes, "활동 중인데 멈춤 표시가 남았다")

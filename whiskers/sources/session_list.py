@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 from whiskers.sources import session_names
@@ -36,21 +37,47 @@ QUESTION_TAIL_BYTES = 256 * 1024  # 마지막 질문만 보면 되므로 끝부�
 QUESTION_MAX_CHARS = 60
 
 
-def _pending_question(transcript: Path) -> str | None:
-    """답을 기다리는 질문이 있으면 그 내용을 돌려준다.
+def _last_record_at(transcript: Path) -> float:
+    """마지막 레코드 시각. 파일 mtime 은 쓰지 않는다.
 
-    "작업중"만으로는 Claude 가 일하는 중인지 **내 답을 기다리는 중**인지 구분이 안 된다.
-    AskUserQuestion 의 tool_use 가 떴는데 대응하는 tool_result 가 아직 없으면 대기 상태다.
+    mtime 은 내용이 안 바뀌어도 갱신될 때가 있다 — 실측으로 **25시간 전에 끝난 세션의
+    mtime 이 5분 전**으로 찍혔다. 그걸 활동 신호로 쓰면 죽은 세션이 "작업중"으로 뜬다.
     """
+    for line in reversed(_tail_lines(transcript)):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        raw = record.get("timestamp")
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def _tail_lines(transcript: Path) -> list[str]:
+    """파일 끝부분만 읽어 완결된 줄들로 돌려준다 (전체를 읽지 않기 위함)."""
     try:
         size = transcript.stat().st_size
         with transcript.open("rb") as handle:
             if size > QUESTION_TAIL_BYTES:
                 handle.seek(size - QUESTION_TAIL_BYTES)
                 handle.readline()  # 잘린 첫 줄 버림
-            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+            return handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
-        return None
+        return []
+
+
+def _pending_question(transcript: Path) -> str | None:
+    """답을 기다리는 질문이 있으면 그 내용을 돌려준다.
+
+    "작업중"만으로는 Claude 가 일하는 중인지 **내 답을 기다리는 중**인지 구분이 안 된다.
+    AskUserQuestion 의 tool_use 가 떴는데 대응하는 tool_result 가 아직 없으면 대기 상태다.
+    """
+    lines = _tail_lines(transcript)
 
     asked: dict[str, str] = {}  # tool_use_id -> 질문
     for line in lines:
@@ -144,11 +171,8 @@ def read_sessions(
         # 훅의 Stop 은 다른 Stop 훅이 종료를 막아도 발화한다 — 그래서 아직 일하는 중인데
         # 'waiting' 으로 굳는 경우가 있다. transcript 가 방금 자랐으면 실제로는 작업 중이다.
         if state == "waiting" and transcript is not None:
-            try:
-                if now - transcript.stat().st_mtime < ACTIVE_WITHIN_SECONDS:
-                    state = "running"
-            except OSError:
-                pass
+            if now - _last_record_at(transcript) < ACTIVE_WITHIN_SECONDS:
+                state = "running"
         summaries.append(
             SessionSummary(
                 session_id=session_id,

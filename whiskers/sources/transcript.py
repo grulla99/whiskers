@@ -102,6 +102,9 @@ class TranscriptTailer:
         self._total_new_tokens = 0
         # 컨텍스트 한도 판정용 최대치 — 압축으로 값이 내려가도 되돌아가지 않는다
         self._peak_input_tokens = 0
+        # 마지막 활동은 **레코드 타임스탬프**로 본다 — 파일 mtime 은 내용이 안 바뀌어도
+        # 갱신될 때가 있어(실측: 25시간 전에 끝난 세션의 mtime 이 5분 전) 못 믿는다.
+        self._last_record_at = 0.0
         self._hook_blocks: list[HookBlock] = []
         self._compactions: list[Compaction] = []
         self._touched_dirs: dict[str, int] = {}  # 디렉토리 -> 마지막으로 건드린 순번
@@ -134,6 +137,10 @@ class TranscriptTailer:
         ranked = sorted(self._touched_dirs.items(), key=lambda kv: -kv[1])
         existing = [path for path, _ in ranked if Path(path).is_dir()]
         return existing[:limit]
+
+    def last_record_at(self) -> float:
+        """이 세션에 마지막으로 기록이 남은 시각. 0 이면 아직 아무것도 못 읽었다."""
+        return self._last_record_at
 
     def context_usage(self) -> ContextUsage | None:
         if self._context is None:
@@ -171,6 +178,10 @@ class TranscriptTailer:
         return list(self._agents.values())
 
     def _ingest(self, record: dict) -> None:
+        stamp = _parse_timestamp(record.get("timestamp"))
+        if stamp > self._last_record_at:
+            self._last_record_at = stamp
+
         if record.get("isSidechain"):
             return  # 서브에이전트 자신의 내부 턴 — 메인 세션 대화 로그가 아님
 
