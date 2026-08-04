@@ -44,12 +44,18 @@ class HookBlock:
 
 @dataclass
 class ContextUsage:
-    """마지막 턴 기준 컨텍스트 점유 추정."""
+    """마지막 턴 기준 컨텍스트 점유 추정 + 세션이 지금까지 태운 총량."""
 
     model: str = ""
-    input_tokens: int = 0  # 입력계 합(신규+캐시읽기+캐시생성) = 컨텍스트 점유 추정
+    # 입력계 합(신규+캐시읽기+캐시생성). 컨텍스트 점유 추정이자 **요청 한 번의 전송량**이다 —
+    # 매 요청이 컨텍스트 전체를 다시 보내므로 도구를 한 번 쓸 때마다 이만큼이 나간다.
+    input_tokens: int = 0
     output_tokens: int = 0
     limit: int = 0
+    total_input_tokens: int = 0  # 세션 시작부터의 전송량 누적
+    # 누적 중 **캐시 재사용이 아닌** 부분(신규 입력 + 캐시 생성). 캐시 읽기는 할인 대상이라
+    # 전송량을 그대로 사용량으로 읽으면 크게 부풀려진다 — 실측 캐시읽기가 전체의 90.8%였다.
+    total_new_tokens: int = 0
 
     @property
     def ratio(self) -> float:

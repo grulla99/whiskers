@@ -531,3 +531,51 @@ class ChatPanelCompactionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CostWarningTest(unittest.IsolatedAsyncioTestCase):
+    """요청 한 번에 너무 많이 태우는 세션은 헤더가 경고해야 한다."""
+
+    def test_tiers(self):
+        from whiskers.state import ContextUsage
+
+        def warn(per_request: int):
+            return T._cost_warning(
+                ContextUsage(input_tokens=per_request, limit=1_000_000, total_input_tokens=per_request)
+            )
+
+        self.assertEqual(warn(90_000), ("", ""), "작은 세션엔 경고를 띄우지 않는다")
+        text, css = warn(T.COST_CAUTION_TOKENS)
+        self.assertIn("200k", text)
+        self.assertEqual(css, "-cost-caution")
+        text, css = warn(799_000)
+        self.assertIn("799k", text)
+        self.assertIn("/compact", text, "무엇을 해야 하는지 함께 알려야 한다")
+        self.assertEqual(css, "-cost-danger")
+        self.assertEqual(T._cost_warning(None), ("", ""))
+
+    async def test_header_is_tinted_and_warning_comes_first(self):
+        from textual.widgets import Header
+        from whiskers.state import ContextUsage
+
+        app = T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"))
+        )
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            header = app.query_one(Header)
+
+            app._update_title(ContextUsage(input_tokens=799_000, limit=1_000_000,
+                                           total_input_tokens=318_500_000, total_new_tokens=7_700_000))
+            await pilot.pause()
+            self.assertIn("-cost-danger", header.classes)
+            # 좁은 패널에선 부제가 잘리므로 경고가 맨 앞이어야 보인다
+            self.assertTrue(app.sub_title.startswith("⚠"), app.sub_title)
+            self.assertIn("누적 신규 7.7M", app.sub_title)
+            self.assertIn("전송 318.5M", app.sub_title)
+
+            app._update_title(ContextUsage(input_tokens=90_000, limit=200_000,
+                                           total_input_tokens=1_000, total_new_tokens=1_000))
+            await pilot.pause()
+            self.assertNotIn("-cost-danger", header.classes, "정상 세션인데 경고색이 남았다")
+            self.assertNotIn("-cost-caution", header.classes)

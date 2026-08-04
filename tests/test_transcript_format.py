@@ -251,3 +251,46 @@ class TailIdempotencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CostAccountingTest(unittest.TestCase):
+    """사용량 경고의 근거 — 요청당 전송량과 누적. 캐시 읽기는 따로 센다."""
+
+    @staticmethod
+    def usage_record(fresh: int, cache_read: int, cache_create: int, timestamp: str) -> dict:
+        return {
+            "type": "assistant",
+            "timestamp": timestamp,
+            "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "..."}],
+                "usage": {
+                    "input_tokens": fresh,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_create,
+                    "output_tokens": 100,
+                },
+            },
+        }
+
+    def test_totals_separate_cache_reuse_from_new_tokens(self):
+        """캐시 읽기는 할인 대상이라 전송량과 섞으면 사용량을 10배 부풀려 읽는다(실측 90.8%가 캐시읽기)."""
+        records = [
+            self.usage_record(10, 300_000, 5_000, "2026-08-03T01:00:00.000Z"),
+            self.usage_record(20, 400_000, 1_000, "2026-08-03T01:01:00.000Z"),
+        ]
+        tailer = TranscriptTailer(str(write_jsonl(records)))
+        tailer.poll()
+        usage = tailer.context_usage()
+
+        self.assertEqual(usage.input_tokens, 20 + 400_000 + 1_000, "요청당 전송량은 마지막 턴 기준")
+        self.assertEqual(usage.total_input_tokens, 30 + 700_000 + 6_000)
+        self.assertEqual(usage.total_new_tokens, 30 + 6_000, "캐시 읽기는 신규에서 빠져야 한다")
+
+    def test_repolling_does_not_double_count(self):
+        path = write_jsonl([self.usage_record(10, 300_000, 5_000, "2026-08-03T01:00:00.000Z")])
+        tailer = TranscriptTailer(str(path))
+        tailer.poll()
+        first = tailer.context_usage().total_input_tokens
+        tailer.poll()
+        self.assertEqual(tailer.context_usage().total_input_tokens, first, "누적이 두 번 더해졌다")

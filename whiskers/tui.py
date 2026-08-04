@@ -120,6 +120,34 @@ def _gauge(ratio: float) -> str:
     return "█" * filled + "░" * (GAUGE_WIDTH - filled)
 
 
+# 요청 한 번의 비용 = 그 순간의 컨텍스트 전체. 도구를 한 번 쓸 때마다 이만큼 다시 나가므로,
+# 컨텍스트가 커진 세션은 Bash 몇 번으로 사용량을 수백만 토큰씩 태운다.
+# 실측(2026-08-03): 797k 짜리 세션이 36요청에 27.8M, 네 세션 합쳐 1분에 16.35M.
+COST_CAUTION_TOKENS = 200_000
+COST_DANGER_TOKENS = 500_000
+
+
+def _short_total(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    return f"{tokens // 1000}k" if tokens >= 1000 else str(tokens)
+
+
+def _cost_warning(context: ContextUsage | None) -> tuple[str, str]:
+    """(헤더 앞에 붙일 경고 문구, Header 에 줄 CSS 클래스).
+
+    문구를 맨 앞에 두는 이유: 좁은 분할 패널에서는 부제가 잘리므로 뒤에 두면 안 보인다.
+    """
+    if context is None or not context.input_tokens:
+        return "", ""
+    per_request = context.input_tokens
+    if per_request >= COST_DANGER_TOKENS:
+        return f"⚠ 요청당 {per_request // 1000}k — /compact 권장", "-cost-danger"
+    if per_request >= COST_CAUTION_TOKENS:
+        return f"△ 요청당 {per_request // 1000}k", "-cost-caution"
+    return "", ""
+
+
 def _is_truncated(text: str) -> bool:
     collapsed = _collapse(text)
     return len(collapsed.splitlines()) > PREVIEW_MAX_LINES or len(collapsed) > PREVIEW_MAX_CHARS
@@ -1351,6 +1379,13 @@ class ClaudeMonitorApp(App):
     Header {
         background: $panel;
     }
+    /* 요청당 비용이 큰 세션은 헤더 자체를 물들인다 — 부제가 잘려도 색은 눈에 걸린다 */
+    Header.-cost-caution {
+        background: $warning 40%;
+    }
+    Header.-cost-danger {
+        background: $error 55%;
+    }
     Footer {
         background: $panel;
     }
@@ -1441,17 +1476,29 @@ class ClaudeMonitorApp(App):
         # 압축 이력은 게이지 옆에 상주시킨다 — 게이지가 낮다고 안심할 게 아니라,
         # 이미 몇 번 버려진 뒤인지가 같이 보여야 한다
         compacted = f"압축 {len(compactions)}회 · " if compactions else ""
+
+        # 요청당 비용 경고를 맨 앞에 — 게이지 숫자만으로는 "이게 사용량"이라는 게 안 읽힌다
+        warning, warning_class = _cost_warning(context)
+        for name in ("-cost-caution", "-cost-danger"):
+            self.query_one(Header).set_class(name == warning_class, name)
+        prefix = f"{warning} · " if warning else ""
+
         # 컨텍스트 사용률을 헤더에 상주시킨다 — performance.md 의 "마지막 20% 회피"를
         # 눈으로 확인할 수 있어야 지켜진다
         if context and context.limit:
-            gauge = _gauge(context.ratio)
+            # 전송량과 "캐시 재사용이 아닌 양"을 함께 — 캐시 읽기는 할인 대상이라
+            # 전송량만 보여주면 사용량을 10배 부풀려 읽게 된다(실측 90.8%가 캐시읽기)
+            burned = (
+                f"누적 신규 {_short_total(context.total_new_tokens)}"
+                f"·전송 {_short_total(context.total_input_tokens)} · "
+            )
             self.sub_title = (
-                f"ctx {gauge} {context.ratio:.0%} "
+                f"{prefix}ctx {_gauge(context.ratio)} {context.ratio:.0%} "
                 f"({context.input_tokens // 1000}k/{context.limit // 1000}k) · "
-                f"{compacted}{session.cwd}"
+                f"{burned}{compacted}{session.cwd}"
             )
         else:
-            self.sub_title = f"{compacted}{session.cwd}"
+            self.sub_title = f"{prefix}{compacted}{session.cwd}"
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item

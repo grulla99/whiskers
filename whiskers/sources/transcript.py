@@ -61,6 +61,8 @@ MAX_MESSAGES = 5000
 STANDARD_CONTEXT_LIMIT = 200_000
 LONG_CONTEXT_LIMIT = 1_000_000
 _INPUT_TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+# 캐시 읽기를 뺀 부분 — 캐시 재사용은 할인되므로 전송량과 따로 봐야 한다
+_NEW_TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens")
 
 
 def _context_limit(model: str, observed_input_tokens: int) -> int:
@@ -96,6 +98,8 @@ class TranscriptTailer:
         self._agents: dict[str, AgentEvent] = {}
         self._messages: list[ChatMessage] = []
         self._context: ContextUsage | None = None
+        self._total_input_tokens = 0
+        self._total_new_tokens = 0
         self._hook_blocks: list[HookBlock] = []
         self._compactions: list[Compaction] = []
         self._touched_dirs: dict[str, int] = {}  # 디렉토리 -> 마지막으로 건드린 순번
@@ -267,7 +271,7 @@ class TranscriptTailer:
                 event.duration_ms = tool_use_result.get("totalDurationMs") or event.duration_ms
 
     def _ingest_usage(self, record: dict) -> None:
-        """마지막 assistant 턴의 usage 로 컨텍스트 점유를 갱신한다."""
+        """마지막 assistant 턴의 usage 로 컨텍스트 점유와 누적 소모량을 갱신한다."""
         message = record.get("message") or {}
         usage = message.get("usage")
         if not isinstance(usage, dict):
@@ -275,12 +279,17 @@ class TranscriptTailer:
         input_tokens = sum(int(usage.get(key) or 0) for key in _INPUT_TOKEN_KEYS)
         if not input_tokens:
             return
+        # tail 은 증분으로만 읽으니 같은 레코드를 두 번 더하지 않는다.
+        self._total_input_tokens += input_tokens
+        self._total_new_tokens += sum(int(usage.get(key) or 0) for key in _NEW_TOKEN_KEYS)
         model = message.get("model") or ""
         self._context = ContextUsage(
             model=model,
             input_tokens=input_tokens,
             output_tokens=int(usage.get("output_tokens") or 0),
             limit=_context_limit(model, input_tokens),
+            total_input_tokens=self._total_input_tokens,
+            total_new_tokens=self._total_new_tokens,
         )
 
     def _ingest_compact_boundary(self, record: dict) -> None:
