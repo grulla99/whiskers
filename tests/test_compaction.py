@@ -345,6 +345,81 @@ class ChatPanelCompactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("요약으로 대체", rendered())
             self.assertIn("압축 1회", app.sub_title)
 
+    async def test_button_and_modal_reach_compactions_without_scrolling(self):
+        """대화 로그를 스크롤해 경계선을 찾지 않아도 되는 경로 — 버튼 → 이력 → 상세."""
+        message = make_message("사라짐", dropped=True)
+        stub_snapshot = Snapshot(
+            session=SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"),
+            messages=[message],
+            compactions=[make_compaction(1, [message], [])],
+        )
+
+        class StubCollector:
+            session = stub_snapshot.session
+
+            def snapshot(self):
+                return stub_snapshot
+
+        app = T.ClaudeMonitorApp(StubCollector())
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+
+            button = app.query_one(T.CompactionButton)
+            self.assertIn("압축 1회", str(button.render()))
+            self.assertIn("-active", button.classes)
+
+            button.on_click()  # 버튼 클릭 → 이력 모달
+            await pilot.pause()
+            self.assertIsInstance(app.screen, T.CompactionHistoryModal)
+
+            row = next(
+                c for c in app.screen.query("#compaction-history-list ListView, ListView").first().children
+                if isinstance(c, T.CompactionHistoryListItem)
+            )
+            self.assertIn("수동 /compact", str(row.query_one(Label).render()))
+
+            await pilot.click(row)  # 한 줄 클릭 → 상세 모달
+            await pilot.pause(0.3)
+            self.assertIsInstance(app.screen, T.CompactionViewModal)
+
+            await pilot.press("escape")  # 상세를 닫으면 이력으로 돌아와야 한다
+            await pilot.pause()
+            self.assertIsInstance(app.screen, T.CompactionHistoryModal)
+
+    async def test_button_explains_itself_when_nothing_was_compacted(self):
+        """압축이 없을 때 버튼이 죽은 것처럼 보이면 안 된다 — 모달이 이유를 말한다."""
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            button = app.query_one(T.CompactionButton)
+            self.assertIn("압축 없음", str(button.render()))
+            self.assertNotIn("-active", button.classes)
+
+            button.on_click()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, T.CompactionHistoryModal)
+            body = str(app.screen.query_one("#compaction-history-empty", Label).render())
+            self.assertIn("아직 압축되지 않았습니다", body)
+
+    async def test_older_compactions_show_the_date(self):
+        """며칠에 걸친 세션에서 시:분만 쓰면 순서가 뒤집혀 보인다 (07-31 11:44 vs 08-03 11:04)."""
+        old = make_compaction(1, [], [])
+        old.timestamp = time.time() - 3 * 86_400
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            app._compactions = [old, make_compaction(1, [], [])]
+            app.action_show_compactions()
+            await pilot.pause()
+
+            rows = [
+                str(c.query_one(Label).render())
+                for c in app.screen.query_one(T.ListView).children
+                if isinstance(c, T.CompactionHistoryListItem)
+            ]
+            self.assertTrue(any("-" in r.split("\n")[0].split("·")[-1] for r in rows),
+                            f"지난 날짜 압축에 월-일이 안 붙었다: {rows}")
+
     async def test_header_shows_compaction_count(self):
         app = await self._app()
         async with app.run_test(size=(190, 70)) as pilot:

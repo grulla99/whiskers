@@ -22,7 +22,7 @@ from rich.markup import escape
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
@@ -72,6 +72,20 @@ def _format_time(timestamp: float) -> str:
     if not timestamp:
         return ""
     return datetime.fromtimestamp(timestamp).strftime("%H:%M")
+
+
+def _format_when(timestamp: float) -> str:
+    """오늘이면 시:분, 다른 날이면 월-일까지.
+
+    압축 이력은 목록으로 나열되므로 시:분만 쓰면 며칠에 걸친 세션에서 순서가 뒤집혀
+    보인다 (실측: 1차 07-31 11:44, 2차 08-03 11:04 → 2차가 더 이른 것처럼 읽힘).
+    """
+    if not timestamp:
+        return ""
+    moment = datetime.fromtimestamp(timestamp)
+    if moment.date() == datetime.now().date():
+        return moment.strftime("%H:%M")
+    return moment.strftime("%m-%d %H:%M")
 
 
 _NOISE_LINE_RE = re.compile(r"^[-=*_#\s]+$")  # 구분선(---), 빈 헤딩 등 미리보기에 무의미한 줄
@@ -490,7 +504,7 @@ def _compaction_divider(compaction: Compaction) -> str:
     preserved = len(compaction.preserved_messages)
     return (
         f"[$error]━━━━ 컨텍스트 압축 · {_trigger_label(compaction.trigger)} · "
-        f"{_format_time(compaction.timestamp)} ━━━━[/]\n"
+        f"{_format_when(compaction.timestamp)} ━━━━[/]\n"
         f"[dim]위쪽 [/dim][$error]{dropped}건[/][dim]이 요약으로 대체 · "
         f"[/][$success]{preserved}건[/][dim]은 원문 유지 · "
         f"{compaction.pre_tokens // 1000}k→{compaction.post_tokens // 1000}k"
@@ -545,7 +559,7 @@ class CompactionViewModal(ViewModal):
         box = VerticalScroll(id="compaction-view-box")
         box.border_title = (
             f"컨텍스트 압축 · {_trigger_label(compaction.trigger)} · "
-            f"{_format_time(compaction.timestamp)}"
+            f"{_format_when(compaction.timestamp)}"
         )
         box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
 
@@ -605,6 +619,113 @@ class CompactionViewModal(ViewModal):
         if len(messages) > COMPACTION_LIST_MAX:
             lines.append(f"   [dim]… 외 {len(messages) - COMPACTION_LIST_MAX}건[/dim]")
         return "\n".join(lines)
+
+
+class CompactionHistoryListItem(ListItem):
+    """압축 이력 한 줄. 클릭하면 그 압축의 상세로 들어간다."""
+
+    def __init__(self, renderable: Label, compaction: Compaction) -> None:
+        super().__init__(renderable, classes=CLICKABLE_CLASS)
+        self.compaction = compaction
+
+
+class CompactionHistoryModal(ViewModal):
+    """이 세션의 압축 이력 목록. 대화 로그를 스크롤해 경계선을 찾지 않아도 되게 한다."""
+
+    BOX_ID = "compaction-history-box"
+
+    CSS = """
+    CompactionHistoryModal {
+        align: center middle;
+        background: $background 70%;
+    }
+    #compaction-history-box {
+        width: 80%;
+        height: 70%;
+        border: round $error;
+        background: $surface;
+        border-title-color: $text;
+        border-title-background: $error-darken-2;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        padding: 0;
+    }
+    #compaction-history-empty { padding: 1 2; }
+    #compaction-history-list > CompactionHistoryListItem { padding: 0 1 1 1; }
+    """
+
+    def __init__(self, compactions: list[Compaction]) -> None:
+        super().__init__()
+        self._compactions = compactions
+
+    def compose(self) -> ComposeResult:
+        box = VerticalScroll(id="compaction-history-box")
+        box.border_title = f"컨텍스트 압축 이력 · {len(self._compactions)}회"
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+
+        with box:
+            if not self._compactions:
+                # 죽은 버튼처럼 보이지 않게, 왜 비었는지와 무엇을 뜻하는지 적어둔다
+                yield Label(
+                    "[bold]이 세션은 아직 압축되지 않았습니다.[/bold]\n\n"
+                    "[dim]컨텍스트가 한도에 다다르면(또는 /compact 를 직접 실행하면) 그때까지의\n"
+                    "대화가 요약문 하나로 대체됩니다. 요약에 담기지 못한 내용은 모델이\n"
+                    "더는 볼 수 없습니다 — 그 순간 무엇이 사라졌는지 여기서 확인할 수 있습니다.\n\n"
+                    "압축이 일어나면 대화 로그에도 경계선이 그려집니다.[/dim]",
+                    id="compaction-history-empty",
+                )
+                return
+
+            total_dropped = sum(len(c.dropped_messages) for c in self._compactions)
+            yield Label(
+                f"  [dim]대화 [/dim][$error]{total_dropped}건[/][dim]이 요약으로 대체됐습니다. "
+                f"한 줄을 클릭하면 요약 전문과 사라진 목록을 봅니다.[/dim]",
+                id="compaction-history-total",
+            )
+            listview = ListView(id="compaction-history-list")
+            with listview:
+                for index, compaction in enumerate(reversed(self._compactions), start=1):
+                    order = len(self._compactions) - index + 1
+                    yield CompactionHistoryListItem(
+                        Label(
+                            f"[$error]⌫[/] [bold]{order}차 · {_trigger_label(compaction.trigger)}[/bold] "
+                            f"[dim]{_format_when(compaction.timestamp)}[/dim]\n"
+                            f"   [dim]{compaction.pre_tokens // 1000}k→"
+                            f"{compaction.post_tokens // 1000}k "
+                            f"({compaction.dropped_tokens // 1000}k 버림) · 사라짐 [/dim]"
+                            f"[$error]{len(compaction.dropped_messages)}건[/]"
+                            f"[dim] / 원문 유지 [/dim]"
+                            f"[$success]{len(compaction.preserved_messages)}건[/]"
+                        ),
+                        compaction=compaction,
+                    )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # 앱 레벨 핸들러까지 올라가면 엉뚱한 처리가 겹치므로 여기서 끊는다
+        event.stop()
+        item = event.item
+        if not isinstance(item, CompactionHistoryListItem):
+            return
+        flash_clicked(item)
+        self.set_timer(
+            CLICK_ACTION_DELAY,
+            lambda: self.app.push_screen(CompactionViewModal(item.compaction)),
+        )
+
+
+class CompactionButton(Static):
+    """압축 이력 모달을 여는 버튼. 키(`c`)와 같은 동작을 마우스로도 할 수 있게 한다."""
+
+    def render_state(self, count: int) -> None:
+        self.update(
+            f"[b]⌫ 압축 {count}회[/b]  [dim]클릭 또는 c[/dim]"
+            if count
+            else "⌫ 압축 없음  [dim]클릭 또는 c[/dim]"
+        )
+        self.set_class(bool(count), "-active")
+
+    def on_click(self) -> None:
+        self.app.action_show_compactions()
 
 
 class ChatPanel(VerticalScroll):
@@ -1125,14 +1246,19 @@ class ClaudeMonitorApp(App):
         dock: bottom;
         height: 2;
     }
-    /* 완료 숨김 버튼 — Footer 바로 위 1줄. 좁은 분할 패널이라 높이를 아낀다 */
-    FilterToggle {
+    /* 버튼 줄 — Footer 바로 위 1줄. 좁은 분할 패널이라 높이를 아낀다 */
+    #button-row {
+        height: 1;
+        background: $surface;
+    }
+    FilterToggle, CompactionButton {
+        width: auto;
         height: 1;
         padding: 0 1;
         background: $surface;
         color: $text-muted;
     }
-    FilterToggle:hover {
+    FilterToggle:hover, CompactionButton:hover {
         background: $primary 25%;
         color: $text;
     }
@@ -1140,11 +1266,17 @@ class ClaudeMonitorApp(App):
         background: $accent 25%;
         color: $text;
     }
+    /* 압축은 '뭔가 사라졌다'는 신호라 완료 숨김(강조색)과 다른 색을 쓴다 */
+    CompactionButton.-active {
+        background: $error 25%;
+        color: $text;
+    }
     """
 
     BINDINGS = [
         ("r", "rename_session", "이름 변경"),
         ("h", "toggle_completed", "완료 숨기기"),
+        ("c", "show_compactions", "압축 이력"),
     ]
 
     def __init__(self, collector: Collector):
@@ -1156,6 +1288,8 @@ class ClaudeMonitorApp(App):
         # 반복하면 데이터가 안 바뀌어도 화면이 깜빡였다(실사용 중 발견된 버그).
         self._last_messages: list[ChatMessage] | None = None
         self._last_compactions: tuple | None = None
+        # 버튼·모달이 폴링을 기다리지 않고 바로 쓸 수 있게 마지막 압축 목록을 들고 있는다
+        self._compactions: list[Compaction] = []
         self._last_agents: list[AgentEvent] | None = None
         self._last_harness_files: list[HarnessFile] | None = None
         self._last_memory_entries: list[MemoryEntry] | None = None
@@ -1174,12 +1308,15 @@ class ClaudeMonitorApp(App):
         # 버튼과 Footer 를 같은 컨테이너에 넣는다 — 둘 다 dock:bottom 으로 두면
         # 영역이 완전히 겹쳐 클릭이 Footer 로 먹힌다(실측으로 확인).
         with Vertical(id="bottom-bar"):
-            yield FilterToggle(id="filter-toggle")
+            with Horizontal(id="button-row"):
+                yield FilterToggle(id="filter-toggle")
+                yield CompactionButton(id="compaction-button")
             yield Footer()
 
     async def on_mount(self) -> None:
         self.theme = self.DEFAULT_THEME
         self.query_one(FilterToggle).render_state(self._hide_completed)
+        self.query_one(CompactionButton).render_state(0)
         self._update_title()
         await self._refresh()
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
@@ -1226,6 +1363,9 @@ class ClaudeMonitorApp(App):
             self.push_screen(
                 TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
             )
+
+    def action_show_compactions(self) -> None:
+        self.push_screen(CompactionHistoryModal(self._compactions))
 
     async def action_toggle_completed(self) -> None:
         self._hide_completed = not self._hide_completed
@@ -1281,6 +1421,8 @@ class ClaudeMonitorApp(App):
                 )
                 self._last_messages = snapshot.messages
                 self._last_compactions = compaction_signature
+                self._compactions = snapshot.compactions
+                self.query_one(CompactionButton).render_state(len(snapshot.compactions))
 
             if snapshot.agents != self._last_agents:
                 self.query_one(AgentPanel).render_agents(snapshot.agents, self._hide_completed)
