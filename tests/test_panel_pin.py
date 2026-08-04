@@ -197,9 +197,87 @@ class CurrentSessionLabelTest(unittest.IsolatedAsyncioTestCase):
     async def test_other_detached_session_still_offers_pinning(self):
         text = await self._render(detached=True, is_current=False)
         self.assertIn("이 창 밖에서 실행 중", text)
-        self.assertIn("클릭하면 이 패널에 고정", text)
+        self.assertIn("p 로 이 패널에 고정", text)
 
     async def test_windowed_current_session_reads_as_here(self):
         text = await self._render(kitty_window_id="3", is_current=True)
         self.assertIn("← 여기", text)
         self.assertNotIn("📌", text)
+
+
+class ClickMeansJumpOnlyTest(unittest.IsolatedAsyncioTestCase):
+    """클릭은 이동 하나만 뜻해야 한다.
+
+    클릭에 고정을 함께 얹었더니 어느 쪽이 일어날지 예측할 수 없어 "클릭해도 터미널창
+    이동이 안 된다"가 됐다(사용자 피드백). 고정은 `p` 키로 분리했다.
+    """
+
+    async def _app(self):
+        from whiskers import tui as T
+        from whiskers.collector import Collector
+        from whiskers.state import SessionInfo
+
+        return T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"))
+        )
+
+    async def _render(self, app, pilot):
+        import time as _time
+        from whiskers import tui as T
+        from whiskers.state import SessionSummary
+
+        panel = app.query_one(T.SessionPanel)
+        await panel.render_sessions([
+            SessionSummary(session_id="win", title="창 있는 세션", state="running",
+                           updated_at=_time.time(), kitty_window_id="18"),
+            SessionSummary(session_id="bg", title="창 없는 세션", state="running",
+                           updated_at=_time.time(), detached=True),
+        ])
+        await pilot.pause()
+        return [c for c in panel.query_one("ListView").children if isinstance(c, T.SessionListItem)]
+
+    async def test_windowed_session_click_jumps(self):
+        from unittest import mock
+        from whiskers import tui as T
+
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            items = await self._render(app, pilot)
+            with mock.patch.object(T.kitty_link, "jump_to_session") as jump:
+                app._activate(items[0])
+                jump.assert_called_once_with("18")
+
+    async def test_windowless_session_click_does_not_pin(self):
+        from unittest import mock
+        from whiskers import tui as T
+
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            items = await self._render(app, pilot)
+            with mock.patch.object(T.panel_pin, "pin_session") as pin:
+                app._activate(items[1])
+                await pilot.pause(0.3)
+                pin.assert_not_called()
+
+    async def test_pin_key_pins_the_highlighted_session(self):
+        from unittest import mock
+        from whiskers import tui as T
+
+        app = await self._app()
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            items = await self._render(app, pilot)
+            app.query_one("#session-list", T.ListView).index = 1  # 창 없는 세션을 고름
+            await pilot.pause()
+            with mock.patch.object(T.panel_pin, "pin_session") as pin, mock.patch.object(
+                T, "transcript_for_session", return_value=None
+            ):
+                app.action_pin_session()
+                await pilot.pause(0.2)
+                # 기록이 없으면 고정하지 않고 알린다
+                pin.assert_not_called()
+            self.assertIsInstance(
+                app.query_one("#session-list", T.ListView).highlighted_child, T.SessionListItem
+            )

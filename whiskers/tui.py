@@ -1205,8 +1205,8 @@ class SessionPanel(VerticalScroll):
                     SessionListItem(
                         Label(
                             f"[dim]⌁[/dim] [dim]{escape(summary.title)}[/dim]\n"
-                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · "
-                            f"[/dim][$accent]클릭하면 이 패널에 고정[/]"
+                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · 이동 불가 · "
+                            f"[/dim][$accent]p 로 이 패널에 고정[/]"
                         ),
                         summary=summary,
                     )
@@ -1466,6 +1466,7 @@ class ClaudeMonitorApp(App):
         ("r", "rename_session", "이름 변경"),
         ("h", "toggle_completed", "완료 숨기기"),
         ("c", "show_compactions", "압축 이력"),
+        ("p", "pin_session", "이 패널에 고정"),
         ("u", "unpin", "고정 해제"),
     ]
 
@@ -1565,11 +1566,15 @@ class ClaudeMonitorApp(App):
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
         elif isinstance(item, SessionListItem):
+            # 클릭은 **이동** 하나만 뜻한다. 고정을 같이 걸어봤더니 어느 쪽이 일어날지
+            # 예측할 수 없어 "클릭해도 이동이 안 된다"가 됐다 — 고정은 `p` 키로 분리했다.
             if item.summary.kitty_window_id:
                 kitty_link.jump_to_session(item.summary.kitty_window_id)
             else:
-                # 이동할 창이 없는 세션(백그라운드·워크트리) — 대신 이 패널을 그 세션에 고정한다
-                self._pin_to_session(item.summary)
+                self.notify(
+                    "이 세션은 kitty 창이 없어 이동할 수 없습니다 — p 를 누르면 이 패널이 그 세션을 봅니다",
+                    severity="warning",
+                )
         elif isinstance(item, HookBlockListItem):
             block = item.block
             self.push_screen(
@@ -1583,7 +1588,7 @@ class ClaudeMonitorApp(App):
             self.notify("그 세션의 대화 기록을 찾지 못했습니다", severity="warning")
             return
         panel_pin.pin_session(summary.session_id)
-        self.notify(f"이 패널을 '{summary.title}' 에 고정했습니다 (u 로 해제)")
+        self.notify(f"이 패널이 '{summary.title}' 를 봅니다 · u 로 해제")
         self._switch_session(_session_info(transcript))
 
     def action_unpin(self) -> None:
@@ -1613,6 +1618,22 @@ class ClaudeMonitorApp(App):
         self._last_checklists = None
         self._last_hook_blocks = None
         self._compactions = []
+
+    def action_pin_session(self) -> None:
+        """세션 목록에서 지금 고른 세션을 이 패널이 보게 한다.
+
+        클릭에 얹지 않고 키로 분리한다 — 클릭 한 번에 이동/고정 중 무엇이 일어날지
+        예측할 수 없으면 "클릭이 안 먹는다"로 느껴진다(사용자 피드백).
+        """
+        try:
+            listview = self.query_one("#session-list", ListView)
+        except NoMatches:
+            return
+        item = listview.highlighted_child
+        if not isinstance(item, SessionListItem):
+            self.notify("세션 목록에서 세션을 먼저 고르세요 (클릭하거나 방향키로 이동)")
+            return
+        self._pin_to_session(item.summary)
 
     def action_show_compactions(self) -> None:
         self.push_screen(CompactionHistoryModal(self._compactions))
