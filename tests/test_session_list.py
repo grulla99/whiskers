@@ -170,3 +170,17 @@ class ActivityWiringTest(unittest.TestCase):
         self._transcript("live", hours_ago=0)
         path = write_state({"live": entry(state="waiting")})
         self.assertEqual(session_list.read_sessions(state_path=path)[0].state, "running")
+
+
+class TranscriptlessEntryTest(unittest.TestCase):
+    """훅만 돌고 대화 기록을 남기지 않는 세션이 목록을 더럽히면 안 된다 (실측 6건)."""
+
+    def test_old_entry_without_transcript_is_dropped(self):
+        path = write_state({"ghost": entry(updated_at=time.time() - 3600)})
+        self.assertEqual(session_list.read_sessions(state_path=path), [])
+
+    def test_just_started_entry_is_kept_briefly(self):
+        """방금 시작한 세션은 파일이 아직 없을 수 있어 곧바로 지우면 깜빡인다."""
+        path = write_state({"newborn": entry(updated_at=time.time())})
+        rows = session_list.read_sessions(state_path=path)
+        self.assertEqual([r.session_id for r in rows], ["newborn"])

@@ -18,7 +18,8 @@ from whiskers.state import SessionSummary
 SESSION_STATE_PATH = "~/.claude-ui/session_state.json"
 PROJECTS_ROOT = Path("~/.claude/projects").expanduser()
 STALE_AFTER_SECONDS = 60 * 60 * 12  # 반나절 넘게 소식 없는 세션은 목록에서 뺀다
-ACTIVE_WITHIN_SECONDS = 15  # 이 안에 transcript 가 자랐으면 실제로 작업 중
+ACTIVE_WITHIN_SECONDS = 15
+NO_TRANSCRIPT_GRACE_SECONDS = 120  # 갓 시작한 세션은 파일이 아직 없을 수 있다  # 이 안에 transcript 가 자랐으면 실제로 작업 중
 TITLE_MAX_CHARS = 46
 
 
@@ -161,6 +162,11 @@ def read_sessions(
         if entry.get("state") == "done" or now - updated_at > STALE_AFTER_SECONDS:
             continue
         transcript = next(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"), None)
+        if transcript is None and now - updated_at > NO_TRANSCRIPT_GRACE_SECONDS:
+            # 대화 기록이 없는 항목은 보여줄 것도, 들어가 볼 것도 없다. 훅만 돌고 transcript 를
+            # 남기지 않는 세션(서브에이전트·spare)이 실측 6건 섞여 목록을 더럽혔다.
+            # 방금 시작한 세션은 아직 파일이 없을 수 있어 잠깐은 유예한다.
+            continue
         title = (
             session_names.get_display_name(session_id)
             or (_read_ai_title(transcript) if transcript else None)
