@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 KITTY_TIMEOUT_SECONDS = 3
@@ -53,6 +54,35 @@ def session_id_for_current_window() -> str | None:
                     return session_id
             return None
     return None
+
+
+_LIVE_CACHE: dict[str, object] = {"at": 0.0, "windows": {}}
+LIVE_CACHE_SECONDS = 5.0  # 패널이 여러 개라 매 폴링마다 kitty 를 부르면 낭비다
+
+
+def windows_running_claude() -> dict[str, str]:
+    """지금 claude 가 돌고 있는 kitty 창 → 그 창의 탭 id.
+
+    "세션 단위는 사용자가 터미널에서 켠 대화창" 이라는 규칙을 지키려면, 마지막 발화가
+    오래됐어도 창에 claude 가 살아 있으면 주세션으로 봐야 한다. 창의 foreground 프로세스를
+    보면 알 수 있다 (실측: 각 대화창에 `claude` 프로세스가 잡힌다).
+    """
+    now = time.monotonic()
+    if now - float(_LIVE_CACHE["at"]) < LIVE_CACHE_SECONDS:
+        return dict(_LIVE_CACHE["windows"])  # type: ignore[arg-type]
+
+    live: dict[str, str] = {}
+    for os_window in _kitty_ls():
+        for tab in os_window.get("tabs") or []:
+            for window in tab.get("windows") or []:
+                for process in window.get("foreground_processes") or []:
+                    command = " ".join(process.get("cmdline") or [])
+                    # 모니터 자신(python -m whiskers.tui)은 대화창이 아니다
+                    if "claude" in command.lower() and "whiskers.tui" not in command:
+                        live[str(window.get("id"))] = str(tab.get("id"))
+                        break
+    _LIVE_CACHE.update({"at": now, "windows": live})
+    return dict(live)
 
 
 def tab_id_for_current_window() -> str | None:

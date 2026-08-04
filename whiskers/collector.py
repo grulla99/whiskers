@@ -22,7 +22,6 @@ from whiskers.sources import (
     kitty_link,
     live_agents,
     memory_watch,
-    panel_pin,
     session_list,
     session_names,
 )
@@ -63,16 +62,13 @@ def find_active_session() -> SessionInfo | None:
     동시에 띄워놔도 "이 탭의 세션"을 정확히 본다. 훅 미등록·kitty 밖 실행 등으로 못 찾으면
     가장 최근에 수정된 transcript 로 폴백한다(정확하지 않을 수 있음).
     """
-    # 사용자가 직접 고정한 세션이 최우선 — 탭 태그로는 백그라운드 세션을 찾을 수 없어
-    # (창이 없어 태그를 못 심는다) 엉뚱한 옛 세션이 잡히던 문제를 사용자가 직접 끊게 한다
-    pinned = panel_pin.get_pinned_session()
-    if pinned:
-        transcript = transcript_for_session(pinned)
-        if transcript is not None:
-            return _session_info(transcript)
-
     session_id = kitty_link.session_id_for_current_window()
     if session_id:
+        # 이 대화창에서 파생된 세션(백그라운드 등) 중 **가장 최근에 활동한 것**을 본다.
+        # 탭 태그는 창에서 마지막으로 시작된 세션을 가리키므로, 거기서 백그라운드 세션을
+        # 띄우면 태그는 그대로 남아 어제 끝난 세션을 계속 보여준다(실측: ctx 85% 오인).
+        # 세션 묶음(주세션 + 하위)이 이미 그 관계를 알고 있으니 그걸 쓴다.
+        session_id = _latest_in_conversation(session_id)
         transcript = transcript_for_session(session_id)
         if transcript is not None:
             return _session_info(transcript)
@@ -81,6 +77,21 @@ def find_active_session() -> SessionInfo | None:
         PROJECTS_ROOT.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
     )
     return _session_info(candidates[0]) if candidates else None
+
+
+def _latest_in_conversation(tagged_session_id: str) -> str:
+    """탭 태그가 가리키는 대화창에서 가장 최근에 활동한 세션 (주세션 또는 그 하위)."""
+    try:
+        groups = session_list.read_sessions()
+    except Exception:
+        return tagged_session_id
+    for main in groups:
+        members = [main, *main.children]
+        if not any(m.session_id == tagged_session_id for m in members):
+            continue
+        newest = max(members, key=lambda m: m.updated_at)
+        return newest.session_id
+    return tagged_session_id
 
 
 class Collector:

@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from whiskers.sources import session_names
+from whiskers.sources import kitty_link, session_names
 from whiskers.state import SessionSummary
 
 SESSION_STATE_PATH = "~/.claude-ui/session_state.json"
@@ -149,18 +149,37 @@ def _scan_ai_title(transcript: Path) -> str | None:
 
 
 def read_sessions(
-    current_session_id: str | None = None, state_path: str = SESSION_STATE_PATH
+    current_session_id: str | None = None,
+    state_path: str = SESSION_STATE_PATH,
+    live_windows: set[str] | None = None,
 ) -> list[SessionSummary]:
+    """대화창(주세션) 목록. 각 주세션의 `children` 에 그 창에서 파생된 하위 세션이 담긴다.
+
+    `live_windows` 는 테스트에서 주입한다 — 안 그러면 실제 kitty 상태가 새어들어
+    테스트가 실행 환경에 따라 흔들린다(실측으로 4건 깨졌다).
+    """
     states = _load_states(state_path)
     now = time.time()
     summaries: list[SessionSummary] = []
+    # 창에 claude 가 살아 있으면 그건 사용자가 켜둔 대화창이다 — 마지막 발화가 오래됐다고
+    # 목록에서 빼면 주세션이 사라지고, 그 대화창에서 파생된 세션이 남의 창 밑으로 붙는다
+    # (실측: tab8 주세션이 26시간 경과로 빠지자 이 대화가 tab11 밑으로 갔다).
+    if live_windows is None:
+        try:
+            live_windows = set(kitty_link.windows_running_claude())
+        except Exception:
+            live_windows = set()
 
     for session_id, entry in states.items():
         if not isinstance(entry, dict):
             continue
         updated_at = float(entry.get("updated_at") or 0)
-        if entry.get("state") == "done" or now - updated_at > STALE_AFTER_SECONDS:
+        window_id = entry.get("kitty_window_id")
+        alive = bool(window_id) and str(window_id) in live_windows
+        if entry.get("state") == "done" and not alive:
             continue
+        # staleness 정리는 **묶은 뒤에** 한다. 여기서 걸러버리면 살아있는 대화창의 주세션이
+        # 사라지고, 그 창에서 파생된 세션이 엉뚱한 창 밑으로 붙는다(실측).
         # 훅은 Codex(GPT) 세션도 기록한다 — 회사 플러그인 리뷰어가 "Claude + Codex 병렬"로
         # 돌기 때문에 리뷰 한 번에 Codex 세션이 하나씩 생긴다(실측 6건). 기록 형식이 달라
         # 파싱할 수 없으니 의도적으로 제외한다 (전에는 "transcript 를 못 찾아서" 우연히 빠졌다).
@@ -186,6 +205,11 @@ def read_sessions(
         if state == "waiting" and transcript is not None:
             if now - _last_record_at(transcript) < ACTIVE_WITHIN_SECONDS:
                 state = "running"
+        # 상태는 셋뿐이다 — 작업중 / 대기 / 답변요청. "유휴" 같은 애매한 구분은 버린다.
+        if question is not None:
+            state = "asking"
+        elif state != "running":
+            state = "waiting"
         summaries.append(
             SessionSummary(
                 session_id=session_id,
@@ -193,6 +217,8 @@ def read_sessions(
                 state=state,
                 updated_at=updated_at,
                 cwd=entry.get("cwd") or "",
+                start_cwd=_first_cwd(transcript),
+                started_at=_first_record_at(transcript),
                 kitty_window_id=entry.get("kitty_window_id"),
                 is_current=session_id == current_session_id,
                 # 창이 없으면 이동할 수 없다 — 숨기는 대신 어디서 도는지 알려준다
@@ -202,6 +228,117 @@ def read_sessions(
             )
         )
 
-    # 이동 가능한 세션을 위로, 그 안에서 최근 활동 순 (창 밖 세션은 참고용이라 아래로)
-    summaries.sort(key=lambda s: (s.detached, -s.updated_at))
-    return summaries
+    return _group_by_conversation(summaries, live_windows)
+
+
+def _first_cwd(transcript: Path | None) -> str:
+    """세션이 **시작될 때**의 작업 디렉토리.
+
+    상태 파일의 cwd 는 대화 중에 바뀔 수 있어(도구가 다른 곳을 들여다보면 갱신된다)
+    묶음 기준으로 못 쓴다. 시작 시점 값은 고정이라 같은 대화창에서 파생된 세션을 잇는 데
+    쓸 수 있다.
+    """
+    if transcript is None:
+        return ""
+    try:
+        with transcript.open("r", encoding="utf-8") as handle:
+            for _ in range(200):  # 앞부분에 반드시 나온다
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("cwd"):
+                    return record["cwd"]
+    except OSError:
+        pass
+    return ""
+
+
+def _first_record_at(transcript: Path | None) -> float:
+    """세션의 첫 기록 시각. 어느 대화창에서 파생됐는지 잇는 데 쓴다."""
+    if transcript is None:
+        return 0.0
+    try:
+        with transcript.open("r", encoding="utf-8") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw = record.get("timestamp")
+                if raw:
+                    return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def _group_by_conversation(
+    summaries: list[SessionSummary], live_windows: set[str]
+) -> list[SessionSummary]:
+    """대화창(kitty 창) 하나를 주세션 하나로 묶고, 나머지는 하위 세션으로 붙인다.
+
+    - 같은 창에 여러 세션이 있으면 **가장 최근 활동한 것이 주세션**, 나머지는 하위
+    - 창이 없는 세션(백그라운드)은 **시작 디렉토리가 같은** 주세션 밑으로 넣는다.
+      어느 창에서 띄웠는지는 Claude Code 가 기록하지 않아 이게 최선의 단서다.
+      맞는 주세션이 없으면 자기가 주세션이 된다(숨기지 않는다).
+    """
+    by_window: dict[str, list[SessionSummary]] = {}
+    windowless: list[SessionSummary] = []
+    for summary in sorted(summaries, key=lambda s: -s.updated_at):
+        if summary.kitty_window_id:
+            by_window.setdefault(summary.kitty_window_id, []).append(summary)
+        else:
+            windowless.append(summary)
+
+    mains: list[SessionSummary] = []
+    for window_id, group in by_window.items():
+        main, *rest = group  # 정렬돼 있으므로 첫 항목이 가장 최근
+        main.children = rest
+        mains.append(main)
+
+    for orphan in windowless:
+        # 시작 디렉토리가 같은 대화창들 중, **자기가 시작된 시점과 가장 가까이 활동했던** 곳.
+        # 디렉토리만 보면 같은 폴더에서 켠 다른 창에 붙는다(실측: 이 대화가 tab11 밑으로 갔다).
+        # 백그라운드 세션은 부모가 마지막 발화를 한 직후에 생기므로 시각이 강한 단서다
+        # (실측: 부모 마지막 기록 04:53:57 → 이 세션 시작 04:54:19, 22초 차).
+        candidates = [m for m in mains if m.start_cwd and m.start_cwd == orphan.start_cwd]
+        parent = None
+        if candidates and orphan.started_at:
+            parent = min(candidates, key=lambda m: abs(m.updated_at - orphan.started_at))
+        elif candidates:
+            parent = candidates[0]
+        if parent is None:
+            mains.append(orphan)  # 붙일 곳이 없으면 스스로 주세션
+            continue
+        orphan.kitty_window_id = parent.kitty_window_id  # 클릭하면 부모 창으로 이동
+        parent.children.append(orphan)
+
+    return _prune(mains, live_windows)
+
+
+def _prune(mains: list[SessionSummary], live_windows: set[str]) -> list[SessionSummary]:
+    """오래된 것을 정리한다 — 단 **살아있는 대화창의 주세션은 남긴다**.
+
+    창에 claude 가 살아 있으면 마지막 발화가 어제여도 사용자가 켜둔 대화창이다. 반대로
+    같은 창에 쌓인 옛 세션들은 하위로 다 보여줄 필요가 없다(실측: 한 창에 13개까지 쌓임).
+    """
+    now = time.time()
+    kept: list[SessionSummary] = []
+    for main in mains:
+        main.children = [
+            child for child in main.children if now - child.updated_at <= STALE_AFTER_SECONDS
+        ]
+        main.children.sort(key=lambda s: -s.updated_at)
+        alive = bool(main.kitty_window_id) and str(main.kitty_window_id) in live_windows
+        fresh = now - main.group_updated_at <= STALE_AFTER_SECONDS
+        if alive or fresh or main.children:
+            kept.append(main)
+    kept.sort(key=lambda s: -s.group_updated_at)  # 하위가 최근이면 그 대화창도 위로
+    return kept

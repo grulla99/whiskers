@@ -24,6 +24,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
     DataTable,
@@ -39,7 +40,7 @@ from textual.widgets import (
 
 from whiskers.collector import Collector, find_active_session, _session_info, transcript_for_session
 from whiskers import translate
-from whiskers.sources import kitty_link, panel_pin, session_names
+from whiskers.sources import kitty_link, session_names
 from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
 from whiskers.state import AgentEvent, ChecklistState, Compaction, SessionInfo, SessionSummary
 
@@ -205,6 +206,7 @@ CLICKABLE_CLASS = "clickable"  # 호버 반응은 이 클래스가 붙은 항목
 CLICKED_CLASS = "clicked"  # 클릭 순간 잠깐 붙였다 떼는 표시
 CLICK_FLASH_SECONDS = 0.28
 CLICK_ACTION_DELAY = 0.12  # 플래시가 한 프레임이라도 보이고 나서 동작하게
+DOUBLE_CLICK_GRACE = 0.32  # 세션 카드: 더블클릭(이름 수정)을 기다리는 시간
 
 
 def flash_clicked(item) -> None:
@@ -1161,29 +1163,60 @@ class HookPanel(VerticalScroll):
             )
 
 
+# 상태는 셋뿐이다. "유휴" 처럼 뜻이 애매한 구분은 쓰지 않는다 — 사용자에게 전달되지 않는다.
 _SESSION_STATE_STYLE = {
     "running": ("●", "$warning", "작업중"),
-    "waiting": ("◆", "$success", "대기"),
-    "idle": ("○", "$text-muted", "유휴"),
-    "unknown": ("·", "$text-muted", "?"),
+    "asking": ("❓", "$error", "답변요청"),  # 내가 답해야 진행된다 — 가장 눈에 띄어야 한다
+    "waiting": ("◇", "$success", "대기"),
 }
+_SESSION_STATE_FALLBACK = _SESSION_STATE_STYLE["waiting"]
 
 
 class SessionListItem(ListItem):
-    """세션 목록 한 줄. 클릭하면 그 세션의 kitty 창으로 이동한다."""
+    """세션 목록 한 줄. 클릭하면 그 세션의 터미널 창으로 이동, 더블클릭하면 이름 수정."""
 
-    def __init__(self, renderable: Label, summary: SessionSummary) -> None:
-        # 창이 있으면 클릭 = 그 창으로 이동, 없으면 클릭 = 이 패널을 그 세션에 고정.
-        # 둘 다 할 일이 있으므로 항상 클릭 가능하다.
-        super().__init__(renderable, classes=CLICKABLE_CLASS)
+    class RenameRequested(Message):
+        def __init__(self, summary: SessionSummary) -> None:
+            super().__init__()
+            self.summary = summary
+
+    def __init__(self, renderable: Label, summary: SessionSummary, is_child: bool = False) -> None:
+        classes = CLICKABLE_CLASS + (" session-child" if is_child else " session-main")
+        super().__init__(renderable, classes=classes)
         self.summary = summary
+
+    def on_click(self, event) -> None:
+        if getattr(event, "chain", 1) >= 2:
+            # 더블클릭은 이름 수정 — 첫 클릭으로 예약된 이동을 취소하고 이걸 대신 처리한다
+            event.stop()
+            self.post_message(self.RenameRequested(self.summary))
+
+
+class SessionToggleItem(ListItem):
+    """`▸ 하위 세션 N개` 줄. 클릭하면 접었다 펼친다.
+
+    주세션 카드 클릭은 **항상 터미널 이동**이어야 하므로(사용자 규칙), 토글은 별도 줄로
+    분리한다 — 같은 클릭에 두 뜻을 얹으면 어느 쪽이 일어날지 예측할 수 없다(경험).
+    """
+
+    def __init__(self, renderable: Label, window_id: str) -> None:
+        super().__init__(renderable, classes=f"{CLICKABLE_CLASS} session-toggle")
+        self.window_id = window_id
 
 
 class SessionPanel(VerticalScroll):
-    BORDER_TITLE = "세션 (클릭하면 이동)"
+    BORDER_TITLE = "세션 (클릭 이동 · 더블클릭 이름수정)"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # 펼쳐 놓은 대화창(창 id). 기본은 접힘 — 하위 세션은 대개 참고용이다.
+        self._expanded: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield ListView(id="session-list")
+
+    def toggle(self, window_id: str) -> None:
+        self._expanded.symmetric_difference_update({window_id})
 
     async def render_sessions(self, sessions: list[SessionSummary]) -> None:
         listview = self.query_one(ListView)
@@ -1194,50 +1227,43 @@ class SessionPanel(VerticalScroll):
             )
             return
 
-        for summary in sessions:
-            # detached 판정보다 is_current 를 먼저 본다. 지금 이 패널이 보고 있는 세션인데
-            # "이 창 밖에서 실행 중"이라고 적으면 앞뒤가 안 맞는다 — 백그라운드 세션은
-            # 창 정보가 없어 항상 detached 로 잡히므로, 고정해서 보고 있어도 그렇게 나왔다.
-            if summary.detached and not summary.is_current:
-                # 이동할 창이 없다 — 숨기지 말고 "어디서 도는지"를 알려준다
-                where = _where_running(summary.cwd)
-                await listview.append(
-                    SessionListItem(
-                        Label(
-                            f"[dim]⌁[/dim] [dim]{escape(summary.title)}[/dim]\n"
-                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · 이동 불가 · "
-                            f"[/dim][$accent]p 로 이 패널에 고정[/]"
-                        ),
-                        summary=summary,
-                    )
-                )
+        for main in sessions:
+            await listview.append(self._card(main, is_child=False))
+            if not main.children:
                 continue
-            if summary.awaiting_answer:
-                # "작업중"과 구분되어야 한다 — 이건 내가 답해줘야 진행되는 상태
-                mark, color, label = "❓", "$warning", "답변 대기"
-            else:
-                mark, color, label = _SESSION_STATE_STYLE.get(
-                    summary.state, _SESSION_STATE_STYLE["unknown"]
-                )
-            # 창이 없는데도 보고 있다면 고정해서 보고 있다는 뜻이다 — 그렇게 표시한다
-            if summary.is_current:
-                here = " [dim]← 📌 고정[/dim]" if summary.detached else " [dim]← 여기[/dim]"
-            else:
-                here = ""
-            detail = (
-                f"[$warning]{escape(summary.question)}[/]"
-                if summary.awaiting_answer and summary.question
-                else f"[dim]{label} · {_format_time(summary.updated_at)}[/dim]"
-            )
+            window_id = str(main.kitty_window_id or main.session_id)
+            expanded = window_id in self._expanded
             await listview.append(
-                SessionListItem(
+                SessionToggleItem(
                     Label(
-                        f"[{color}]{mark}[/{color}] {escape(summary.title)}{here}\n"
-                        f"   {detail}"
+                        f"   [dim]{'▾' if expanded else '▸'} 하위 세션 {len(main.children)}개"
+                        f" · 이 대화창에서 파생됨[/dim]"
                     ),
-                    summary=summary,
+                    window_id=window_id,
                 )
             )
+            if expanded:
+                for child in main.children:
+                    await listview.append(self._card(child, is_child=True))
+
+    @staticmethod
+    def _card(summary: SessionSummary, is_child: bool) -> SessionListItem:
+        mark, color, label = _SESSION_STATE_STYLE.get(summary.state, _SESSION_STATE_FALLBACK)
+        indent = "     " if is_child else ""
+        here = " [dim]← 여기[/dim]" if summary.is_current else ""
+        detail = (
+            f"[$error]{escape(summary.question)}[/]"
+            if summary.state == "asking" and summary.question
+            else f"[dim]{label} · {_format_time(summary.updated_at)}[/dim]"
+        )
+        return SessionListItem(
+            Label(
+                f"{indent}[{color}]{mark}[/{color}] {escape(summary.title)}{here}\n"
+                f"{indent}   {detail}"
+            ),
+            summary=summary,
+            is_child=is_child,
+        )
 
 
 class ChecklistPanel(VerticalScroll):
@@ -1405,10 +1431,39 @@ class ClaudeMonitorApp(App):
     ListItem.clicked > Label {
         background: transparent;
     }
-    /* 세션은 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시 */
+    /* 세션 카드는 클릭하면 창 이동까지 일어나므로 조금 더 강하게 표시.
+       자식 Label 을 transparent 로 명시해야 **제목 글자 칸까지** 색이 든다 —
+       안 주면 Label 이 패널 배경을 칠해 글자만 색이 빠진다(실측). */
     SessionListItem.clickable:hover {
-        background: $accent 22%;
+        background: $accent 25%;
         border-left: thick $accent;
+    }
+    SessionListItem.clickable:hover > Label {
+        background: transparent;
+    }
+    /* 클릭 순간 — 호버보다 확실히 진하게 해서 "눌렸다"가 분명히 보이게 */
+    SessionListItem.clicked {
+        background: $accent 90%;
+    }
+    SessionListItem.clicked > Label {
+        background: transparent;
+    }
+    /* 하위 세션 카드·토글 줄: 주세션과 구분되게 한 단 들여쓰고 톤을 낮춘다 */
+    #session-list > SessionListItem.session-child {
+        background: $panel 40%;
+    }
+    #session-list > SessionListItem.session-child.clickable:hover {
+        background: $accent 20%;
+    }
+    #session-list > SessionToggleItem {
+        padding: 0 1 1 1;
+    }
+    SessionToggleItem.clickable:hover {
+        background: $secondary 22%;
+        border-left: thick $secondary;
+    }
+    SessionToggleItem.clickable:hover > Label {
+        background: transparent;
     }
     FileListItem.clickable:hover {
         border-left: thick $secondary;
@@ -1466,8 +1521,6 @@ class ClaudeMonitorApp(App):
         ("r", "rename_session", "이름 변경"),
         ("h", "toggle_completed", "완료 숨기기"),
         ("c", "show_compactions", "압축 이력"),
-        ("p", "pin_session", "이 패널에 고정"),
-        ("u", "unpin", "고정 해제"),
     ]
 
     def __init__(self, collector: Collector):
@@ -1481,6 +1534,7 @@ class ClaudeMonitorApp(App):
         self._last_compactions: tuple | None = None
         # 버튼·모달이 폴링을 기다리지 않고 바로 쓸 수 있게 마지막 압축 목록을 들고 있는다
         self._compactions: list[Compaction] = []
+        self._pending_activate = None  # 첫 클릭으로 예약된 동작 (더블클릭 시 취소)
         self._last_agents: list[AgentEvent] | None = None
         self._last_harness_files: list[HarnessFile] | None = None
         self._last_memory_entries: list[MemoryEntry] | None = None
@@ -1556,7 +1610,18 @@ class ClaudeMonitorApp(App):
             return
         # 눌린 걸 먼저 보여주고 동작한다 — 모달이 덮거나 탭이 바뀌면 플래시를 볼 틈이 없다
         flash_clicked(item)
-        self.set_timer(CLICK_ACTION_DELAY, lambda: self._activate(item))
+        # 세션은 더블클릭에 이름 수정이 걸려 있어, 두 번째 클릭을 기다릴 틈을 준다.
+        # 그 사이 두 번째 클릭이 오면 예약된 이동을 취소한다.
+        delay = DOUBLE_CLICK_GRACE if isinstance(item, SessionListItem) else CLICK_ACTION_DELAY
+        self._pending_activate = self.set_timer(delay, lambda: self._activate(item))
+
+    def on_session_list_item_rename_requested(
+        self, event: SessionListItem.RenameRequested
+    ) -> None:
+        if self._pending_activate is not None:
+            self._pending_activate.stop()  # 첫 클릭으로 예약된 창 이동 취소
+            self._pending_activate = None
+        self._rename_session(event.summary)
 
     def _activate(self, item) -> None:
         if isinstance(item, FileListItem) and item.file_path:
@@ -1581,28 +1646,13 @@ class ClaudeMonitorApp(App):
                 TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
             )
 
-    def _pin_to_session(self, summary: SessionSummary) -> None:
-        """이 패널이 볼 세션을 바꾼다 (창이 없어 이동할 수 없는 세션용)."""
-        transcript = transcript_for_session(summary.session_id)
-        if transcript is None:
-            self.notify("그 세션의 대화 기록을 찾지 못했습니다", severity="warning")
-            return
-        panel_pin.pin_session(summary.session_id)
-        self.notify(f"이 패널이 '{summary.title}' 를 봅니다 · u 로 해제")
-        self._switch_session(_session_info(transcript))
-
-    def action_unpin(self) -> None:
-        if not panel_pin.unpin():
-            self.notify("고정된 세션이 없습니다")
-            return
-        session = find_active_session()
-        if session is not None:
-            self.notify("고정을 풀었습니다 — 이 탭의 세션을 따라갑니다")
-            self._switch_session(session)
-
     @work
     async def _switch_session(self, session: SessionInfo) -> None:
-        """패널이 볼 세션을 바꾼다. 화면에 남은 옛 세션 내용을 먼저 비운다."""
+        """패널이 볼 세션을 바꾼다 — 같은 대화창에서 새 세션이 시작되면 따라간다.
+
+        화면에 남은 옛 세션 내용을 먼저 비운다: 대화 로그는 덧붙이기 방식이라 새 세션이
+        더 길면 옛 대화 뒤에 이어붙는다.
+        """
         self._collector = Collector(session)
         self._reset_render_cache()
         await self.query_one(ChatPanel).reset()
@@ -1619,22 +1669,6 @@ class ClaudeMonitorApp(App):
         self._last_hook_blocks = None
         self._compactions = []
 
-    def action_pin_session(self) -> None:
-        """세션 목록에서 지금 고른 세션을 이 패널이 보게 한다.
-
-        클릭에 얹지 않고 키로 분리한다 — 클릭 한 번에 이동/고정 중 무엇이 일어날지
-        예측할 수 없으면 "클릭이 안 먹는다"로 느껴진다(사용자 피드백).
-        """
-        try:
-            listview = self.query_one("#session-list", ListView)
-        except NoMatches:
-            return
-        item = listview.highlighted_child
-        if not isinstance(item, SessionListItem):
-            self.notify("세션 목록에서 세션을 먼저 고르세요 (클릭하거나 방향키로 이동)")
-            return
-        self._pin_to_session(item.summary)
-
     def action_show_compactions(self) -> None:
         self.push_screen(CompactionHistoryModal(self._compactions))
 
@@ -1648,15 +1682,30 @@ class ClaudeMonitorApp(App):
 
     @work
     async def action_rename_session(self) -> None:
+        """이 패널이 보고 있는 세션의 이름을 바꾼다 (`r` 키)."""
         session = self._collector.session
-        current_name = session.display_name or session.session_id
-        new_name = await self.push_screen_wait(RenameModal(current_name))
+        new_name = await self.push_screen_wait(
+            RenameModal(session.display_name or session.session_id)
+        )
         if not new_name or new_name == session.display_name:
             return
         session_names.set_display_name(session.session_id, new_name)
         session.display_name = new_name  # 다음 폴링(최대 2.5초)까지 기다리지 않고 즉시 반영
         self._update_title()
         self._sync_kitty_tab_title(new_name)
+
+    @work
+    async def _rename_session(self, summary: SessionSummary) -> None:
+        """세션 목록에서 더블클릭한 세션의 이름을 바꾼다."""
+        new_name = await self.push_screen_wait(RenameModal(summary.title))
+        if not new_name or new_name == summary.title:
+            return
+        session_names.set_display_name(summary.session_id, new_name)
+        self._last_sessions = None  # 다음 폴링을 기다리지 않고 목록을 다시 그린다
+        if summary.session_id == self._collector.session.session_id:
+            self._collector.session.display_name = new_name
+            self._update_title()
+        await self._refresh()
 
     @staticmethod
     def _sync_kitty_tab_title(name: str) -> None:

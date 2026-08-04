@@ -151,18 +151,45 @@ class SessionInfo:
 
 @dataclass
 class SessionSummary:
-    """세션 목록 한 줄. 훅이 남긴 상태 + transcript 의 자동 제목을 합친 것."""
+    """세션 목록 한 줄. 훅이 남긴 상태 + transcript 의 자동 제목을 합친 것.
+
+    **세션 단위는 사용자가 터미널에서 켠 대화창**이다 (터미널 3개에 각각 Claude 를 켜면
+    주세션 3개). 대화를 진행하다 추가로 생긴 세션(백그라운드 등)은 그 대화창의
+    **하위 세션**으로 `children` 에 담아 접었다 펼친다 — 목록을 평평하게 늘어놓으면
+    "내가 켠 건 하나인데 왜 여러 개냐"가 된다.
+    """
 
     session_id: str
     title: str  # ai-title(Claude 자동 생성) 또는 사용자 지정 이름
-    state: str  # running | waiting | idle | done | unknown
+    # 상태는 셋뿐이다: running(작업중) | waiting(대기) | asking(답변요청).
+    # "유휴" 같은 애매한 구분은 쓰지 않는다 — 사용자에게 뜻이 전달되지 않는다.
+    state: str
     updated_at: float
     cwd: str = ""
+    # 세션이 **시작될 때**의 디렉토리 — 대화 중 바뀌는 cwd 와 달리 고정이라
+    # 같은 대화창에서 파생된 세션을 잇는 단서가 된다
+    start_cwd: str = ""
+    started_at: float = 0.0  # 세션의 첫 기록 시각 — 어느 대화창에서 파생됐는지 잇는 단서
     kitty_window_id: str | None = None
     is_current: bool = False
     awaiting_answer: bool = False  # 질문을 띄워놓고 내 답을 기다리는 중
-    detached: bool = False  # kitty 창 밖(워크트리·백그라운드)에서 도는 세션 — 이동 불가
+    detached: bool = False  # kitty 창 밖(백그라운드 등)에서 도는 세션 — 직접 이동 불가
     question: str = ""  # 무엇을 묻고 있는지 (한 줄)
+    children: list[SessionSummary] = field(default_factory=list)  # 이 대화창의 하위 세션
+
+    @property
+    def group_updated_at(self) -> float:
+        """대화창 전체의 최근 활동 — 하위 세션이 더 최근이면 그것을 따른다.
+
+        주세션의 `updated_at` 을 덮어쓰면 안 된다: "이 대화창에서 가장 최근 세션"을 고를 때
+        주세션과 하위가 동률이 되어 주세션이 뽑히고, 패널이 옛 세션을 계속 본다(실측).
+        """
+        return max([self.updated_at, *(c.updated_at for c in self.children)])
+
+    @property
+    def jump_window_id(self) -> str | None:
+        """클릭 시 이동할 창. 하위 세션은 자기 창이 없으니 부모 것을 물려받는다."""
+        return self.kitty_window_id
 
 
 @dataclass

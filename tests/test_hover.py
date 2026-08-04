@@ -95,19 +95,15 @@ class HoverTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([bg(i) for i in items], base, "목록을 벗어났는데 색이 남았다")
 
-    async def test_windowless_session_is_clickable_for_pinning(self):
-        """창이 없는 세션도 클릭 대상이다 — 이동은 못 하지만 이 패널에 고정할 수 있다.
-
-        전에는 클릭할 일이 없다고 보고 반응을 껐는데, 그 세션(백그라운드 대화)이야말로
-        사용자가 보고 싶은 것이었다. 그래서 클릭 = 고정으로 바꿨고 호버도 반응해야 한다.
-        """
+    async def test_child_session_is_clickable(self):
+        """하위 세션도 클릭 대상이다 — 부모 창을 물려받아 그 터미널로 이동한다."""
         app = await self._setup()
         async with app.run_test(size=(190, 70)) as pilot:
             await pilot.pause()
             panel = app.query_one(T.SessionPanel)
             await panel.render_sessions(
-                [SessionSummary(session_id="a", title="창 모름", state="idle",
-                                updated_at=time.time(), detached=True)]
+                [SessionSummary(session_id="a", title="하위", state="waiting",
+                                updated_at=time.time(), kitty_window_id="3", detached=True)]
             )
             await pilot.pause()
 
