@@ -37,9 +37,9 @@ from textual.widgets import (
     Static,
 )
 
-from whiskers.collector import Collector, find_active_session
+from whiskers.collector import Collector, find_active_session, _session_info, transcript_for_session
 from whiskers import translate
-from whiskers.sources import kitty_link, session_names
+from whiskers.sources import kitty_link, panel_pin, session_names
 from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
 from whiskers.state import AgentEvent, ChecklistState, Compaction, SessionInfo, SessionSummary
 
@@ -899,6 +899,16 @@ class ChatPanel(VerticalScroll):
         self._rendered = 0  # 이미 그린 건수 — 새로 온 것만 덧붙인다
         self._rendered_compactions: tuple = ()
 
+    async def reset(self) -> None:
+        """다른 세션으로 바꿀 때 호출한다.
+
+        덧붙이기 방식이라 새 세션이 더 길면 `len(messages) < self._rendered` 가 거짓이 되어
+        **옛 세션 대화 뒤에 새 세션 대화가 이어붙는다**. 건수만으로는 세션 교체를 알 수 없다.
+        """
+        await self.query_one(ListView).clear()
+        self._rendered = 0
+        self._rendered_compactions = ()
+
     async def render_messages(
         self, messages: list[ChatMessage], compactions: list[Compaction] | None = None
     ) -> None:
@@ -1163,10 +1173,9 @@ class SessionListItem(ListItem):
     """세션 목록 한 줄. 클릭하면 그 세션의 kitty 창으로 이동한다."""
 
     def __init__(self, renderable: Label, summary: SessionSummary) -> None:
-        # 이동할 창을 모르는 세션(훅이 창 정보를 못 남긴 경우)은 클릭해도 할 일이 없다
-        super().__init__(
-            renderable, classes=CLICKABLE_CLASS if summary.kitty_window_id else None
-        )
+        # 창이 있으면 클릭 = 그 창으로 이동, 없으면 클릭 = 이 패널을 그 세션에 고정.
+        # 둘 다 할 일이 있으므로 항상 클릭 가능하다.
+        super().__init__(renderable, classes=CLICKABLE_CLASS)
         self.summary = summary
 
 
@@ -1193,7 +1202,8 @@ class SessionPanel(VerticalScroll):
                     SessionListItem(
                         Label(
                             f"[dim]⌁[/dim] [dim]{escape(summary.title)}[/dim]\n"
-                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · 이동 불가[/dim]"
+                            f"   [dim]이 창 밖에서 실행 중 · {escape(where)} · "
+                            f"[/dim][$accent]클릭하면 이 패널에 고정[/]"
                         ),
                         summary=summary,
                     )
@@ -1449,6 +1459,7 @@ class ClaudeMonitorApp(App):
         ("r", "rename_session", "이름 변경"),
         ("h", "toggle_completed", "완료 숨기기"),
         ("c", "show_compactions", "압축 이력"),
+        ("u", "unpin", "고정 해제"),
     ]
 
     def __init__(self, collector: Collector):
@@ -1546,13 +1557,55 @@ class ClaudeMonitorApp(App):
             self.push_screen(CompactionViewModal(item.compaction))
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
-        elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
-            kitty_link.jump_to_session(item.summary.kitty_window_id)
+        elif isinstance(item, SessionListItem):
+            if item.summary.kitty_window_id:
+                kitty_link.jump_to_session(item.summary.kitty_window_id)
+            else:
+                # 이동할 창이 없는 세션(백그라운드·워크트리) — 대신 이 패널을 그 세션에 고정한다
+                self._pin_to_session(item.summary)
         elif isinstance(item, HookBlockListItem):
             block = item.block
             self.push_screen(
                 TextViewModal(f"{block.hook_name} · {block.tool} 차단", block.reason)
             )
+
+    def _pin_to_session(self, summary: SessionSummary) -> None:
+        """이 패널이 볼 세션을 바꾼다 (창이 없어 이동할 수 없는 세션용)."""
+        transcript = transcript_for_session(summary.session_id)
+        if transcript is None:
+            self.notify("그 세션의 대화 기록을 찾지 못했습니다", severity="warning")
+            return
+        panel_pin.pin_session(summary.session_id)
+        self.notify(f"이 패널을 '{summary.title}' 에 고정했습니다 (u 로 해제)")
+        self._switch_session(_session_info(transcript))
+
+    def action_unpin(self) -> None:
+        if not panel_pin.unpin():
+            self.notify("고정된 세션이 없습니다")
+            return
+        session = find_active_session()
+        if session is not None:
+            self.notify("고정을 풀었습니다 — 이 탭의 세션을 따라갑니다")
+            self._switch_session(session)
+
+    @work
+    async def _switch_session(self, session: SessionInfo) -> None:
+        """패널이 볼 세션을 바꾼다. 화면에 남은 옛 세션 내용을 먼저 비운다."""
+        self._collector = Collector(session)
+        self._reset_render_cache()
+        await self.query_one(ChatPanel).reset()
+        await self._refresh()
+
+    def _reset_render_cache(self) -> None:
+        """세션을 바꿨으면 diff 캐시를 비워야 옛 화면이 남지 않는다."""
+        self._last_messages = None
+        self._last_compactions = None
+        self._last_agents = None
+        self._last_harness_files = None
+        self._last_memory_entries = None
+        self._last_checklists = None
+        self._last_hook_blocks = None
+        self._compactions = []
 
     def action_show_compactions(self) -> None:
         self.push_screen(CompactionHistoryModal(self._compactions))

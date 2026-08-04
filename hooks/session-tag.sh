@@ -21,7 +21,7 @@ export CM_PAYLOAD CM_STATE_FILE
 # 상태 파일을 갱신하고, 세션 ID 를 (stdout 이 아니라) 명령 치환으로 돌려받는다
 HOOK_OUT=$(
     /usr/bin/python3 - <<'PY' 2>/dev/null || true
-import json, os, subprocess, sys, tempfile, time
+import json, os, sys, tempfile, time
 
 try:
     payload = json.loads(os.environ.get("CM_PAYLOAD") or "{}")
@@ -41,52 +41,12 @@ state = {
 }.get(event)
 
 
-def kitty_socket():
-    listen = os.environ.get("KITTY_LISTEN_ON")
-    if listen:
-        return listen
-    import glob
-
-    candidates = sorted(glob.glob("/tmp/mykitty-*"), key=os.path.getmtime, reverse=True)
-    return f"unix:{candidates[0]}" if candidates else ""
-
-
-def focused_window_id():
-    """지금 사용자가 보고 있는 kitty 창.
-
-    백그라운드 세션은 데몬이 띄우므로 KITTY_WINDOW_ID 를 물려받지 못한다. 그러면 패널이
-    "이 탭의 세션"을 못 찾아, 그 창에서 예전에 돌던 세션을 계속 보여준다 — 사용자는
-    자기가 대화하는 세션이라고 읽으므로 엉뚱한 값(어제 끝난 세션의 85%)을 자기 것으로
-    오인했다. 프롬프트를 방금 넣은 순간이니 포커스된 창이 곧 대화 중인 창이다.
-    """
-    socket = kitty_socket()
-    if not socket:
-        return None
-    try:
-        result = subprocess.run(
-            ["kitty", "@", "--to", socket, "ls"],
-            capture_output=True, text=True, timeout=3,
-        )
-        os_windows = json.loads(result.stdout)
-    except Exception:
-        return None
-    # 포커스된 창만 쓴다. kitty 가 최전면이 아니면 is_focused 가 아예 없는데, 그때
-    # is_active 로 물러서면 **엉뚱한 탭**에 묶인다(실측: 다른 탭 창 25 로 붙었다).
-    # 잘못 묶는 것이 지금 문제의 원인이었으므로, 확실하지 않으면 묶지 않는다.
-    for os_window in os_windows:
-        for tab in os_window.get("tabs") or []:
-            for window in tab.get("windows") or []:
-                if window.get("is_focused"):
-                    return str(window.get("id"))
-    return None
-
-
+# 창은 **환경변수로 확실한 경우에만** 붙인다.
+# 포커스된 창을 추정해 붙여봤지만 엉뚱한 탭(일정관리)에 묶였다 — 사용자가 대화하던 곳은
+# 다른 탭이었다. 백그라운드 세션이 어느 창에서 띄워졌는지는 Claude Code 가 어디에도
+# 기록하지 않아(job state.json·timeline 확인) 알아낼 방법이 없다. 대신 패널에서 세션을
+# 클릭해 직접 고정하도록 했다 (whiskers/sources/panel_pin.py).
 window_id = os.environ.get("KITTY_WINDOW_ID")
-guessed = False
-if not window_id and event == "UserPromptSubmit":
-    # 사람이 방금 입력한 순간에만 추정한다 — 자동으로 도는 세션이 남의 창을 가로채지 않게
-    window_id = focused_window_id()
-    guessed = bool(window_id)
 
 # 세션 ID·창 ID 는 호출한 셸이 kitty user-var 로 심는 데 쓴다
 print(session_id)
@@ -119,7 +79,6 @@ entry.update(
 # 어느 kitty 창에서 도는 세션인지 — 세션 목록에서 그 창으로 이동하는 데 쓴다
 if window_id:
     entry["kitty_window_id"] = window_id
-    entry["window_guessed"] = guessed  # 추정으로 붙인 것인지 (bg 세션)
 data[session_id] = entry
 
 # 끝난 지 오래된 세션은 버린다 — 안 그러면 이 파일이 무한히 커진다

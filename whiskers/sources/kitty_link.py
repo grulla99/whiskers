@@ -55,6 +55,22 @@ def session_id_for_current_window() -> str | None:
     return None
 
 
+def tab_id_for_current_window() -> str | None:
+    """모니터가 떠 있는 **탭** id.
+
+    고정(panel_pin)의 키로 쓴다 — 패널을 재시작하면 창 id 는 바뀌지만 탭은 그대로다.
+    창 id 로 키를 잡으면 재시작 한 번에 고정이 날아간다(실측).
+    """
+    own_window_id = os.environ.get("KITTY_WINDOW_ID")
+    if not own_window_id:
+        return None
+    for os_window in _kitty_ls():
+        for tab in os_window.get("tabs") or []:
+            if any(str(w.get("id")) == str(own_window_id) for w in tab.get("windows") or []):
+                return str(tab.get("id"))
+    return None
+
+
 ATTENTION_FILE = Path("~/.claude-ui/attention_tabs.json").expanduser()
 
 

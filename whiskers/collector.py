@@ -22,6 +22,7 @@ from whiskers.sources import (
     kitty_link,
     live_agents,
     memory_watch,
+    panel_pin,
     session_list,
     session_names,
 )
@@ -62,6 +63,14 @@ def find_active_session() -> SessionInfo | None:
     동시에 띄워놔도 "이 탭의 세션"을 정확히 본다. 훅 미등록·kitty 밖 실행 등으로 못 찾으면
     가장 최근에 수정된 transcript 로 폴백한다(정확하지 않을 수 있음).
     """
+    # 사용자가 직접 고정한 세션이 최우선 — 탭 태그로는 백그라운드 세션을 찾을 수 없어
+    # (창이 없어 태그를 못 심는다) 엉뚱한 옛 세션이 잡히던 문제를 사용자가 직접 끊게 한다
+    pinned = panel_pin.get_pinned_session()
+    if pinned:
+        transcript = transcript_for_session(pinned)
+        if transcript is not None:
+            return _session_info(transcript)
+
     session_id = kitty_link.session_id_for_current_window()
     if session_id:
         transcript = transcript_for_session(session_id)

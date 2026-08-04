@@ -630,3 +630,35 @@ class ActivityWiringTest(unittest.IsolatedAsyncioTestCase):
             app._update_title(None, [], time.time())
             await pilot.pause()
             self.assertNotIn("-idle", app.query_one(Header).classes, "활동 중인데 멈춤 표시가 남았다")
+
+
+class SessionSwitchTest(unittest.IsolatedAsyncioTestCase):
+    """패널이 볼 세션을 바꿀 때 옛 세션 내용이 남으면 안 된다.
+
+    대화 로그는 덧붙이기 방식이라, 새 세션이 더 길면 `len(messages) < _rendered` 가 거짓이
+    되어 **옛 대화 뒤에 새 대화가 이어붙는다** — 건수만으로는 세션 교체를 알 수 없다.
+    """
+
+    async def test_longer_session_does_not_append_onto_the_old_one(self):
+        app = T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="x", transcript_path="/dev/null", cwd="/tmp"))
+        )
+        async with app.run_test(size=(190, 70)) as pilot:
+            await pilot.pause()
+            panel = app.query_one(T.ChatPanel)
+            await panel.render_messages([make_message("옛 세션 발화")])
+            await pilot.pause()
+
+            await panel.reset()  # 세션 교체
+            await panel.render_messages(
+                [make_message("새 세션 1"), make_message("새 세션 2")]  # 더 길다
+            )
+            await pilot.pause()
+
+            texts = [
+                str(c.query_one(Label).render())
+                for c in panel.query_one("ListView").children
+                if isinstance(c, T.MessageListItem)
+            ]
+            self.assertEqual(len(texts), 2, f"옛 세션 대화가 남았다: {texts}")
+            self.assertFalse(any("옛 세션" in t for t in texts))

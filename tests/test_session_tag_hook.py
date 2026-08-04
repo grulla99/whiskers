@@ -8,8 +8,11 @@
 그리고 창 연결에는 실제로 겪은 함정이 있다: 백그라운드 세션은 데몬이 띄우므로
 `KITTY_WINDOW_ID` 를 물려받지 못한다. 그러면 패널이 그 창에서 예전에 돌던 세션을 계속
 보여주고, 사용자는 그걸 자기 대화로 읽는다 — 어제 끝난 세션의 ctx 85% 를 자기 값으로
-오인한 사고가 실제로 있었다. 그래서 사람이 프롬프트를 넣은 순간에는 포커스된 창을
-추정해서 붙이되, **확실하지 않으면 붙이지 않는다**(잘못 붙이는 게 더 나쁘다).
+오인한 사고가 실제로 있었다.
+
+포커스된 창을 추정해 붙이는 방법을 시도했다가 **되돌렸다**: 사용자가 대화 중이던 탭이
+아닌 엉뚱한 탭에 묶였다. 잘못 묶는 것이 애초의 문제였으므로, 이 훅은 환경변수로 확실한
+경우에만 창을 붙이고, 나머지는 패널에서 사용자가 직접 고정한다(`panel_pin`).
 """
 
 from __future__ import annotations
@@ -92,22 +95,18 @@ class HookContractTest(unittest.TestCase):
 
 
 class WindowBindingTest(unittest.TestCase):
-    def test_real_window_id_is_used_and_not_marked_as_a_guess(self):
+    def test_window_id_is_recorded_from_the_environment(self):
         _, state = run_hook(PROMPT, env={"KITTY_WINDOW_ID": "42"})
         self.assertEqual(state["sess-1"]["kitty_window_id"], "42")
-        self.assertFalse(state["sess-1"]["window_guessed"])
 
-    def test_no_window_is_recorded_when_the_guess_fails(self):
-        """추정에 실패하면 붙이지 않는다 — 엉뚱한 창에 묶는 게 안 묶는 것보다 나쁘다."""
-        _, state = run_hook(PROMPT)  # KITTY_WINDOW_ID 없음 + 소켓 없음
-        self.assertNotIn("kitty_window_id", state["sess-1"])
+    def test_no_window_is_recorded_when_the_environment_lacks_one(self):
+        """창을 추정하지 않는다.
 
-    def test_only_a_human_prompt_triggers_the_guess(self):
-        """자동으로 도는 세션이 사람 창을 가로채지 않게, UserPromptSubmit 에서만 추정한다."""
-        result, _ = run_hook({**PROMPT, "hook_event_name": "Stop"}, env={"WHISKERS_TRACE": "1"})
-        self.assertEqual(result.returncode, 0)
-        # Stop 이벤트에서는 kitty 조회 자체를 하지 않으므로 창 정보가 남지 않는다
-        _, state = run_hook({**PROMPT, "hook_event_name": "Stop"})
+        포커스된 창을 추정해 붙여봤더니 사용자가 대화 중이던 탭이 아닌 **엉뚱한 탭**에
+        묶였다. 잘못 묶는 것이 애초에 문제였으니, 확실하지 않으면 붙이지 않고 패널에서
+        직접 고정하게 한다 (whiskers/sources/panel_pin.py).
+        """
+        _, state = run_hook(PROMPT)  # KITTY_WINDOW_ID 없음
         self.assertNotIn("kitty_window_id", state["sess-1"])
 
 
