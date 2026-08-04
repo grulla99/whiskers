@@ -161,6 +161,13 @@ def read_sessions(
         updated_at = float(entry.get("updated_at") or 0)
         if entry.get("state") == "done" or now - updated_at > STALE_AFTER_SECONDS:
             continue
+        # 훅은 Codex(GPT) 세션도 기록한다 — 회사 플러그인 리뷰어가 "Claude + Codex 병렬"로
+        # 돌기 때문에 리뷰 한 번에 Codex 세션이 하나씩 생긴다(실측 6건). 기록 형식이 달라
+        # 파싱할 수 없으니 의도적으로 제외한다 (전에는 "transcript 를 못 찾아서" 우연히 빠졌다).
+        recorded_path = entry.get("transcript_path") or ""
+        if recorded_path and not recorded_path.startswith(str(PROJECTS_ROOT)):
+            continue
+
         transcript = next(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"), None)
         if transcript is None and now - updated_at > NO_TRANSCRIPT_GRACE_SECONDS:
             # 대화 기록이 없는 항목은 보여줄 것도, 들어가 볼 것도 없다. 훅만 돌고 transcript 를

@@ -184,3 +184,32 @@ class TranscriptlessEntryTest(unittest.TestCase):
         path = write_state({"newborn": entry(updated_at=time.time())})
         rows = session_list.read_sessions(state_path=path)
         self.assertEqual([r.session_id for r in rows], ["newborn"])
+
+
+class ForeignToolSessionTest(unittest.TestCase):
+    """훅은 Codex(GPT) 세션도 기록한다 — 회사 플러그인 리뷰어가 Claude+Codex 병렬로 돌기 때문.
+
+    기록 형식이 달라 파싱할 수 없으므로 목록에 넣지 않는다. 실측 6건이 섞여 있었다.
+    """
+
+    def test_codex_session_is_excluded(self):
+        path = write_state(
+            {
+                "019fcae7-c34e-75a1-b9db-8d23eb3ebcae": entry(
+                    transcript_path="/Users/junho/.codex/sessions/2026/08/04/rollout-x.jsonl",
+                    updated_at=time.time(),
+                )
+            }
+        )
+        self.assertEqual(session_list.read_sessions(state_path=path), [])
+
+    def test_claude_session_path_is_kept(self):
+        path = write_state(
+            {
+                "keep": entry(
+                    transcript_path=f"{session_list.PROJECTS_ROOT}/-Users-junho/keep.jsonl",
+                    updated_at=time.time(),
+                )
+            }
+        )
+        self.assertEqual([r.session_id for r in session_list.read_sessions(state_path=path)], ["keep"])
