@@ -256,7 +256,8 @@ class ClickMeansJumpOnlyTest(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(190, 70)) as pilot:
             await pilot.pause()
             items = await self._render(app, pilot)
-            with mock.patch.object(T.panel_pin, "pin_session") as pin:
+            # 고정 경로에 아예 들어가지 않아야 한다 (기록이 없어서 중간에 멈추는 것과 구분)
+            with mock.patch.object(app, "_pin_to_session") as pin:
                 app._activate(items[1])
                 await pilot.pause(0.3)
                 pin.assert_not_called()
