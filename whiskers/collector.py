@@ -19,6 +19,7 @@ from pathlib import Path
 
 from whiskers.sources import (
     harness_watch,
+    hud_context,
     kitty_link,
     live_agents,
     memory_watch,
@@ -73,10 +74,10 @@ def find_active_session() -> SessionInfo | None:
         if transcript is not None:
             return _session_info(transcript)
 
-    candidates = sorted(
-        PROJECTS_ROOT.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    return _session_info(candidates[0]) if candidates else None
+    # 여기서 "가장 최근에 수정된 transcript" 로 물러서면 **남의 세션**을 이 탭의 것으로
+    # 보여준다 — 새 터미널에서 세션을 막 시작했는데 대화 로그·에이전트·체크리스트가 이미
+    # 들어차 있던 원인이다. 모를 때는 모른다고 하는 게 맞다.
+    return None
 
 
 def _latest_in_conversation(tagged_session_id: str) -> str:
@@ -132,12 +133,25 @@ class Collector:
         return merged
 
     def snapshot(self) -> Snapshot:
+        if not self.session.transcript_path:
+            return Snapshot(session=self.session, generated_at=time.time())
         self.session.display_name = session_names.get_display_name(self.session.session_id)
 
         snap = Snapshot(session=self.session, generated_at=time.time())
         snap.agents = self._merge_agents(self._transcript_tailer.poll())
         snap.messages = self._transcript_tailer.recent_messages()
+        # 컨텍스트 수치는 claude-hud 캐시(= Claude Code 가 statusline 에 주는 공식 값)를
+        # 먼저 쓴다 — 사용자가 보는 hud 숫자와 어긋나면 안 된다. 없으면 직접 계산.
         snap.context = self._transcript_tailer.context_usage()
+        official = hud_context.read_context(
+            self.session.transcript_path, seen_until=self._transcript_tailer.last_record_at()
+        )
+        if official is not None:
+            if snap.context is not None:  # 누적 소모량은 hud 캐시에 없으니 유지한다
+                official.total_input_tokens = snap.context.total_input_tokens
+                official.total_new_tokens = snap.context.total_new_tokens
+                official.model = snap.context.model
+            snap.context = official
         snap.hook_blocks = self._transcript_tailer.hook_blocks()
         snap.compactions = self._transcript_tailer.compactions()
         # 파일 mtime 은 내용이 안 바뀌어도 갱신될 때가 있어 활동 신호로 쓰지 않는다

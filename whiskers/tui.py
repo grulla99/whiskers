@@ -1558,6 +1558,10 @@ class ClaudeMonitorApp(App):
                 yield CompactionButton(id="compaction-button")
             yield Footer()
 
+    @property
+    def _session_resolved(self) -> bool:
+        return bool(self._collector.session.transcript_path)
+
     async def on_mount(self) -> None:
         self.theme = self.DEFAULT_THEME
         self.query_one(FilterToggle).render_state(self._hide_completed)
@@ -1658,6 +1662,14 @@ class ClaudeMonitorApp(App):
         await self.query_one(ChatPanel).reset()
         await self._refresh()
 
+    def _show_unresolved(self) -> None:
+        """세션을 특정하지 못한 상태를 그대로 알린다 — 빈 화면보다 이유가 필요하다."""
+        self.title = "세션 특정 중"
+        self.sub_title = "이 탭에서 대화를 한 번 주고받으면 잡힙니다 (훅이 창에 세션을 심는 시점)"
+        for name in ("-cost-caution", "-cost-danger", "-idle"):
+            self.query_one(Header).set_class(False, name)
+        self.query_one(CompactionButton).render_state(0)
+
     def _reset_render_cache(self) -> None:
         """세션을 바꿨으면 diff 캐시를 비워야 옛 화면이 남지 않는다."""
         self._last_messages = None
@@ -1724,6 +1736,17 @@ class ClaudeMonitorApp(App):
             return  # 이전 폴링이 아직 끝나기 전 다음 타이머 tick이 겹치는 것 방지
         self._refreshing = True
         try:
+            if not self._session_resolved:
+                # 이 탭의 세션을 아직 못 찾았다. 여기서 "가장 최근 세션"으로 때우면 남의
+                # 대화가 이 탭 것으로 보인다 — 잡힐 때까지 비워두고 계속 다시 시도한다.
+                found = find_active_session()
+                if found is None:
+                    self._show_unresolved()
+                    return
+                self._collector = Collector(found)
+                self._reset_render_cache()
+                await self.query_one(ChatPanel).reset()
+
             snapshot = self._collector.snapshot()
             self._update_title(snapshot.context, snapshot.compactions, snapshot.last_activity_at)
 
@@ -1789,8 +1812,10 @@ def main() -> None:
     else:
         session = find_active_session()
 
+    # 못 찾아도 죽지 않는다 — 새 터미널에서는 첫 대화 전까지 세션을 알 수 없고,
+    # 그때 종료해버리면 패널이 아예 안 뜬다. 빈 상태로 떠서 잡힐 때까지 기다린다.
     if session is None:
-        raise SystemExit("활성 세션을 찾지 못했습니다")
+        session = SessionInfo(session_id="", transcript_path="", cwd=str(Path.cwd()))
     ClaudeMonitorApp(Collector(session)).run()
 
 

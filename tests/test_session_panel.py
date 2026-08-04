@@ -138,3 +138,44 @@ class SessionPanelTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnresolvedSessionTest(unittest.IsolatedAsyncioTestCase):
+    """이 탭의 세션을 모를 때 **남의 세션을 보여주면 안 된다**.
+
+    전에는 "가장 최근에 수정된 transcript" 로 물러섰다 — 새 터미널에서 세션을 막 시작했는데
+    대화 로그·에이전트·체크리스트가 이미 들어차 있던 원인이다(사용자 신고).
+    """
+
+    def test_find_active_session_gives_up_instead_of_guessing(self):
+        from unittest import mock
+        from whiskers import collector
+
+        with mock.patch.object(collector.kitty_link, "session_id_for_current_window",
+                               return_value=None):
+            self.assertIsNone(collector.find_active_session())
+
+    def test_collector_with_no_transcript_returns_an_empty_snapshot(self):
+        from whiskers.collector import Collector
+
+        snap = Collector(SessionInfo(session_id="", transcript_path="", cwd="/tmp")).snapshot()
+        self.assertEqual(snap.messages, [])
+        self.assertEqual(snap.agents, [])
+        self.assertEqual(snap.checklists, [])
+        self.assertIsNone(snap.context)
+
+    async def test_panel_says_why_it_is_empty(self):
+        from unittest import mock
+        from textual.widgets import Header
+        from whiskers.collector import Collector
+
+        app = T.ClaudeMonitorApp(
+            Collector(SessionInfo(session_id="", transcript_path="", cwd="/tmp"))
+        )
+        with mock.patch.object(T, "find_active_session", return_value=None):
+            async with app.run_test(size=(190, 70)) as pilot:
+                await pilot.pause()
+                self.assertEqual(app.title, "세션 특정 중")
+                self.assertIn("대화를 한 번 주고받으면", app.sub_title)
+                classes = app.query_one(Header).classes
+                self.assertNotIn("-cost-danger", classes)
