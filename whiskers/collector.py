@@ -119,6 +119,7 @@ class Collector:
         snap.messages = self._transcript_tailer.recent_messages()
         snap.context = self._transcript_tailer.context_usage()
         snap.hook_blocks = self._transcript_tailer.hook_blocks()
+        snap.compactions = self._transcript_tailer.compactions()
 
         # 소스 하나가 예상 못한 이유로 실패해도(권한 오류, 손상된 markdown 등)
         # 나머지 패널은 계속 그려야 하므로 개별적으로 격리한다.
@@ -182,3 +183,13 @@ if __name__ == "__main__":
         print(f"  {checklist.slug}: {checklist.completed_count}/{checklist.total_count}")
 
     print(f"memory entries: {len(result.memory_entries)}")
+
+    print(f"compactions: {len(result.compactions)}")
+    for compaction in result.compactions:
+        print(
+            f"  [{compaction.trigger}] {compaction.pre_tokens // 1000}k"
+            f"→{compaction.post_tokens // 1000}k · "
+            f"사라짐 {len(compaction.dropped_messages)}건 / "
+            f"원문 유지 {len(compaction.preserved_messages)}건 · "
+            f"요약 {len(compaction.summary)}자"
+        )

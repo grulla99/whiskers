@@ -40,7 +40,7 @@ from whiskers.collector import Collector, find_active_session
 from whiskers import translate
 from whiskers.sources import kitty_link, session_names
 from whiskers.state import AgentStatus, ChatMessage, ContextUsage, HarnessFile, HookBlock, MemoryEntry
-from whiskers.state import AgentEvent, ChecklistState, SessionInfo, SessionSummary
+from whiskers.state import AgentEvent, ChecklistState, Compaction, SessionInfo, SessionSummary
 
 KITTY_TAB_TITLE_TIMEOUT_SECONDS = 2
 
@@ -467,6 +467,146 @@ class MessageViewModal(ViewModal):
             yield Markdown(self._original_body, id="message-view-body")
 
 
+class CompactionListItem(ListItem):
+    """대화 로그 중간의 압축 경계선. 클릭하면 요약 전문과 사라진 대화 목록을 연다."""
+
+    def __init__(self, renderable: Label, compaction: Compaction) -> None:
+        super().__init__(renderable, classes=CLICKABLE_CLASS)
+        self.compaction = compaction
+
+
+def _trigger_label(trigger: str) -> str:
+    return {"manual": "수동 /compact", "auto": "자동 · 한도 임박"}.get(trigger, trigger)
+
+
+def _one_line(text: str, limit: int = 90) -> str:
+    """여러 줄 발화를 목록용 한 줄로."""
+    collapsed = " ".join(_collapse(text).split())
+    return (collapsed[:limit].rstrip() + "…") if len(collapsed) > limit else (collapsed or "(빈 내용)")
+
+
+def _compaction_divider(compaction: Compaction) -> str:
+    dropped = len(compaction.dropped_messages)
+    preserved = len(compaction.preserved_messages)
+    return (
+        f"[$error]━━━━ 컨텍스트 압축 · {_trigger_label(compaction.trigger)} · "
+        f"{_format_time(compaction.timestamp)} ━━━━[/]\n"
+        f"[dim]위쪽 [/dim][$error]{dropped}건[/][dim]이 요약으로 대체 · "
+        f"[/][$success]{preserved}건[/][dim]은 원문 유지 · "
+        f"{compaction.pre_tokens // 1000}k→{compaction.post_tokens // 1000}k"
+        f"({compaction.dropped_tokens // 1000}k 버림)[/dim]\n"
+        f"[dim]클릭하면 요약 전문 · 사라진 대화 목록[/dim]"
+    )
+
+
+COMPACTION_LIST_MAX = 80  # 모달에 나열할 대화 건수 상한 (넘으면 "외 N건"으로 알린다)
+
+
+class CompactionViewModal(ViewModal):
+    """압축 한 건의 전모 — 무엇이 사라졌고, 무엇이 남았고, 요약은 뭐라고 적혔는지."""
+
+    BOX_ID = "compaction-view-box"
+    BODY_ID = "compaction-view-body"
+
+    CSS = """
+    CompactionViewModal {
+        align: center middle;
+        background: $background 70%;
+    }
+    #compaction-view-box {
+        width: 96%;
+        height: 92%;
+        border: round $error;
+        background: $surface;
+        border-title-color: $text;
+        border-title-background: $error-darken-2;
+        border-title-style: bold;
+        border-subtitle-color: $text-muted;
+        padding: 0;
+    }
+    #compaction-head {
+        background: $panel;
+        padding: 1 2;
+        border-bottom: solid $error-darken-2;
+    }
+    #compaction-stats { padding-bottom: 1; }
+    #compaction-dropped { color: $text-muted; }
+    #compaction-preserved { color: $text-muted; padding-top: 1; }
+    #compaction-summary-heading { padding-top: 1; }
+    #compaction-view-body { padding: 1 2; }
+    """
+
+    def __init__(self, compaction: Compaction) -> None:
+        super().__init__()
+        self._compaction = compaction
+
+    def compose(self) -> ComposeResult:
+        compaction = self._compaction
+        box = VerticalScroll(id="compaction-view-box")
+        box.border_title = (
+            f"컨텍스트 압축 · {_trigger_label(compaction.trigger)} · "
+            f"{_format_time(compaction.timestamp)}"
+        )
+        box.border_subtitle = "esc·q 닫기  +/- 크기  ⇘ 드래그"
+
+        with box:
+            with Vertical(id="compaction-head"):
+                yield Label(self._stats_text(), id="compaction-stats")
+                yield Label(
+                    self._message_block(
+                        f"[$error]⌫ 요약으로 대체된 대화 {len(compaction.dropped_messages)}건[/]"
+                        "  [dim]— 원문은 모델 컨텍스트에서 사라졌다[/dim]",
+                        compaction.dropped_messages,
+                    ),
+                    id="compaction-dropped",
+                )
+                yield Label(
+                    self._message_block(
+                        f"[$success]⏺ 원문으로 남은 대화 {len(compaction.preserved_messages)}건[/]",
+                        compaction.preserved_messages,
+                    ),
+                    id="compaction-preserved",
+                )
+                yield Label(
+                    "[bold]요약 전문[/bold]  [dim]— 위 대화들을 대신해 컨텍스트에 남은 내용[/dim]",
+                    id="compaction-summary-heading",
+                )
+            # 제목은 본문에 섞지 않는다 — 한국어 제목이 끼면 번역 버튼 노출 판정
+            # (translate.looks_english)이 흐려지고, 번역할 때도 제목까지 함께 넘어간다
+            self._original_body = (
+                compaction.summary
+                or "*요약 레코드를 찾지 못했습니다 (기록이 아직 쓰이는 중일 수 있음).*"
+            )
+            yield Markdown(self._original_body, id="compaction-view-body")
+
+    def _stats_text(self) -> str:
+        compaction = self._compaction
+        parts = [
+            f"[bold]{compaction.pre_tokens:,}[/bold] → [bold]{compaction.post_tokens:,}[/bold] 토큰",
+            f"이번에 버린 양 [bold $error]{compaction.dropped_tokens:,}[/]",
+            f"압축에 걸린 시간 {compaction.duration_ms / 1000:.0f}초",
+        ]
+        if compaction.cumulative_dropped_tokens is not None:
+            # 세션 누적값이라 이번 한 건의 양과 다를 수 있어 따로 표기한다
+            parts.append(f"[dim]세션 누적 버림 {compaction.cumulative_dropped_tokens:,}[/dim]")
+        return "  ·  ".join(parts)
+
+    @staticmethod
+    def _message_block(heading: str, messages: list[ChatMessage]) -> str:
+        if not messages:
+            return f"{heading}\n   [dim](없음)[/dim]"
+        lines = [heading]
+        for message in messages[:COMPACTION_LIST_MAX]:
+            speaker = "나" if message.role == "user" else "Claude"
+            lines.append(
+                f"   [dim]{_format_time(message.timestamp)}[/dim] "
+                f"[bold]{speaker}[/bold] {escape(_one_line(message.text))}"
+            )
+        if len(messages) > COMPACTION_LIST_MAX:
+            lines.append(f"   [dim]… 외 {len(messages) - COMPACTION_LIST_MAX}건[/dim]")
+        return "\n".join(lines)
+
+
 class ChatPanel(VerticalScroll):
     BORDER_TITLE = "대화 로그 (클릭하면 전문)"
 
@@ -476,41 +616,75 @@ class ChatPanel(VerticalScroll):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._rendered = 0  # 이미 그린 건수 — 새로 온 것만 덧붙인다
+        self._rendered_compactions: tuple = ()
 
-    async def render_messages(self, messages: list[ChatMessage]) -> None:
+    async def render_messages(
+        self, messages: list[ChatMessage], compactions: list[Compaction] | None = None
+    ) -> None:
         listview = self.query_one(ListView)
+        compactions = compactions or []
+        signature = tuple((c.timestamp, bool(c.summary)) for c in compactions)
 
         # 대화는 세션 처음부터 전부 남긴다. 매번 지우고 다시 만들면 건수에 비례해 느려지므로
-        # **늘어난 만큼만 덧붙인다**. 목록이 줄었으면(다른 세션 등) 처음부터 다시 그린다.
-        if len(messages) < self._rendered:
+        # 평소엔 **늘어난 만큼만 덧붙인다**. 다만 압축이 일어나면 이미 그린 위쪽 항목들의
+        # 표시가 바뀌므로(요약으로 대체됨/원문 유지) 그때는 전체를 다시 그린다 — 압축은
+        # 세션당 몇 번뿐이라 비용이 문제되지 않는다.
+        rebuild = signature != self._rendered_compactions or len(messages) < self._rendered
+        if rebuild:
             await listview.clear()
             self._rendered = 0
+            self._rendered_compactions = signature
         if not messages:
             if self._rendered == 0:
                 await listview.append(ListItem(Label("[dim]대화 없음[/dim]")))
             return
-
-        new_messages = messages[self._rendered :]
-        if not new_messages:
+        if self._rendered >= len(messages):
             return
-        self._rendered = len(messages)
 
-        # 시간순(오래된 것부터) — 처음부터 쭉 읽기 위한 순서이고, 덧붙이기와도 맞는다
-        for msg in new_messages:
-            is_user = msg.role == "user"
-            # 테마 변수로 색을 잡아 테마를 바꿔도 따라오게 한다
-            color = "$success" if is_user else "$secondary"
-            speaker = "나" if is_user else "Claude"
-            head = (
-                f"[{color}]▍[/{color}] [bold {color}]{speaker}[/] "
-                f"[dim]{_format_time(msg.timestamp)}[/dim]"
-            )
-            preview = _preview(msg.text)
-            more = "  [dim]…[/dim]" if _is_truncated(msg.text) else ""
-            await listview.append(
-                MessageListItem(Label(f"{head}\n{escape(preview)}{more}"), message=msg)
-            )
+        boundaries: dict[int, list[Compaction]] = {}
+        for compaction in compactions:
+            boundaries.setdefault(compaction.message_index, []).append(compaction)
+
+        # 시간순(오래된 것부터) — 처음부터 쭉 읽기 위한 순서이고, 덧붙이기와도 맞는다.
+        # 마지막 한 바퀴(index == len)는 발화 없이 경계선만 그리는 자리다 — 압축 직후엔
+        # 아직 새 발화가 없어서 경계가 목록 맨 끝에 온다.
+        for index in range(self._rendered, len(messages) + 1):
+            # 경계선은 전체를 다시 그릴 때만 넣는다. 덧붙이기 경로에선 이미 다 그려져 있고
+            # (경계가 새로 생기면 signature 가 바뀌어 rebuild 로 온다), 특히 **맨 끝에 있던
+            # 경계는 그 index 가 그대로 다음 시작점이 되므로** 조건 없이 그리면 중복된다.
+            if rebuild:
+                for compaction in boundaries.get(index, ()):
+                    await listview.append(
+                        CompactionListItem(
+                            Label(_compaction_divider(compaction)), compaction=compaction
+                        )
+                    )
+            if index < len(messages):
+                await listview.append(self._message_item(messages[index]))
+        self._rendered = len(messages)
         listview.scroll_end(animate=False)  # 최신이 아래이므로 끝으로
+
+    @staticmethod
+    def _message_item(msg: ChatMessage) -> MessageListItem:
+        is_user = msg.role == "user"
+        # 테마 변수로 색을 잡아 테마를 바꿔도 따라오게 한다
+        color = "$success" if is_user else "$secondary"
+        speaker = "나" if is_user else "Claude"
+        if msg.dropped:
+            # 원문이 모델 컨텍스트에서 사라진 발화 — 기록으로는 계속 읽을 수 있다
+            mark = "  [$error]⌫ 요약으로 대체[/]"
+        elif msg.survived_compaction:
+            mark = "  [$success]⏺ 원문 유지[/]"
+        else:
+            mark = ""
+        head = (
+            f"[{color}]▍[/{color}] [bold {color}]{speaker}[/] "
+            f"[dim]{_format_time(msg.timestamp)}[/dim]{mark}"
+        )
+        preview = escape(_preview(msg.text))
+        more = "  [dim]…[/dim]" if _is_truncated(msg.text) else ""
+        body = f"[dim]{preview}[/dim]" if msg.dropped else preview
+        return MessageListItem(Label(f"{head}\n{body}{more}"), message=msg)
 
 
 def _short_model(model: str | None) -> str:
@@ -890,9 +1064,21 @@ class ClaudeMonitorApp(App):
     /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다.
        왼쪽 1칸은 호버 시 나타나는 강조 띠 자리 — 평상시엔 투명해서 글자가 밀리지 않는다. */
     #chat-list > MessageListItem,
+    #chat-list > CompactionListItem,
     #session-list > SessionListItem,
     #hook-list > HookBlockListItem {
         padding: 0 1 1 1;
+    }
+    /* 압축 경계는 대화 카드가 아니라 '여기서 잘렸다'는 구분선이므로 배경을 따로 깔아
+       스크롤 중에도 눈에 걸리게 한다.
+       선택자에 id·클래스를 붙여 위쪽의 `ListView > ListItem { background: transparent }`
+       와 `ListItem.clickable:hover` 보다 우선순위가 낮아지지 않게 한다. */
+    #chat-list > CompactionListItem {
+        background: $error 12%;
+    }
+    CompactionListItem.clickable:hover {
+        background: $error 28%;
+        border-left: thick $error;
     }
 
     /* 호버 반응은 .clickable 이 붙은 항목에만 — 섹션 헤더나 이동할 창을 모르는 세션은
@@ -969,6 +1155,7 @@ class ClaudeMonitorApp(App):
         # 이전 폴링과 내용이 같으면 다시 그리지 않는다 — clear()+append()를 매번
         # 반복하면 데이터가 안 바뀌어도 화면이 깜빡였다(실사용 중 발견된 버그).
         self._last_messages: list[ChatMessage] | None = None
+        self._last_compactions: tuple | None = None
         self._last_agents: list[AgentEvent] | None = None
         self._last_harness_files: list[HarnessFile] | None = None
         self._last_memory_entries: list[MemoryEntry] | None = None
@@ -997,19 +1184,25 @@ class ClaudeMonitorApp(App):
         await self._refresh()
         self.set_interval(POLL_INTERVAL_SECONDS, self._refresh)
 
-    def _update_title(self, context: ContextUsage | None = None) -> None:
+    def _update_title(
+        self, context: ContextUsage | None = None, compactions: list[Compaction] | None = None
+    ) -> None:
         session = self._collector.session
         self.title = session.display_name or session.session_id
+        # 압축 이력은 게이지 옆에 상주시킨다 — 게이지가 낮다고 안심할 게 아니라,
+        # 이미 몇 번 버려진 뒤인지가 같이 보여야 한다
+        compacted = f"압축 {len(compactions)}회 · " if compactions else ""
         # 컨텍스트 사용률을 헤더에 상주시킨다 — performance.md 의 "마지막 20% 회피"를
         # 눈으로 확인할 수 있어야 지켜진다
         if context and context.limit:
             gauge = _gauge(context.ratio)
             self.sub_title = (
                 f"ctx {gauge} {context.ratio:.0%} "
-                f"({context.input_tokens // 1000}k/{context.limit // 1000}k) · {session.cwd}"
+                f"({context.input_tokens // 1000}k/{context.limit // 1000}k) · "
+                f"{compacted}{session.cwd}"
             )
         else:
-            self.sub_title = session.cwd
+            self.sub_title = f"{compacted}{session.cwd}"
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
@@ -1022,6 +1215,8 @@ class ClaudeMonitorApp(App):
     def _activate(self, item) -> None:
         if isinstance(item, FileListItem) and item.file_path:
             self.push_screen(FileViewModal(item.file_path))
+        elif isinstance(item, CompactionListItem):
+            self.push_screen(CompactionViewModal(item.compaction))
         elif isinstance(item, MessageListItem):
             self.push_screen(MessageViewModal(item.message))
         elif isinstance(item, SessionListItem) and item.summary.kitty_window_id:
@@ -1070,11 +1265,22 @@ class ClaudeMonitorApp(App):
         self._refreshing = True
         try:
             snapshot = self._collector.snapshot()
-            self._update_title(snapshot.context)
+            self._update_title(snapshot.context, snapshot.compactions)
 
-            if snapshot.messages != self._last_messages:
-                await self.query_one(ChatPanel).render_messages(snapshot.messages)
+            # 압축이 일어나면 이미 있던 ChatMessage 의 표시 상태만 **제자리에서** 바뀐다.
+            # 같은 객체를 들고 비교하므로 목록 비교로는 그 변화를 못 잡는다 — 압축 이력도 함께 본다.
+            compaction_signature = tuple(
+                (c.timestamp, len(c.dropped_messages), bool(c.summary)) for c in snapshot.compactions
+            )
+            if (
+                snapshot.messages != self._last_messages
+                or compaction_signature != self._last_compactions
+            ):
+                await self.query_one(ChatPanel).render_messages(
+                    snapshot.messages, snapshot.compactions
+                )
                 self._last_messages = snapshot.messages
+                self._last_compactions = compaction_signature
 
             if snapshot.agents != self._last_agents:
                 self.query_one(AgentPanel).render_agents(snapshot.agents, self._hide_completed)

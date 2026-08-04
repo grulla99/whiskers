@@ -61,6 +61,41 @@ class ChatMessage:
     role: str  # "user" | "assistant"
     text: str
     timestamp: float
+    uuid: str = ""  # 압축 시 보존 목록과 대조하기 위한 레코드 식별자
+    # 컨텍스트 압축 후 이 발화의 **원문**이 모델 컨텍스트에 남아 있는지.
+    # dropped=True 는 요약문으로 대체돼 원문이 사라졌다는 뜻이다 — transcript 기록에는
+    # 남아 있으므로 화면에서는 계속 읽을 수 있고, 모델만 못 보는 상태다.
+    dropped: bool = False
+    # 압축을 **겪고도** 원문이 남은 발화. 압축 뒤에 오간 대화는 아직 겪지 않았으므로 False —
+    # 이 둘이 모두 False 면 "표시할 것이 없다"는 뜻이 된다.
+    survived_compaction: bool = False
+
+
+@dataclass
+class Compaction:
+    """컨텍스트 압축 한 건 — 무엇이 요약으로 대체되고 무엇이 원문으로 남았는지.
+
+    Claude Code 는 압축할 때 `type:"system", subtype:"compact_boundary"` 레코드에
+    버린 양(preTokens→postTokens)과 **원문으로 남긴 메시지 목록**
+    (`preservedMessages.uuids`)을 다 적어둔다. 그래서 추정이 아니라 정확히 가를 수 있다.
+    요약 전문은 바로 뒤에 오는 `isCompactSummary` 레코드에 담긴다.
+    """
+
+    trigger: str  # manual(/compact 직접 실행) | auto(한도 임박해서 자동)
+    timestamp: float
+    pre_tokens: int
+    post_tokens: int
+    duration_ms: int = 0
+    summary: str = ""  # 버려진 대화를 대신하는 요약 전문
+    cumulative_dropped_tokens: int | None = None  # 세션 누적 (기록에 없는 경우도 있음)
+    message_index: int = 0  # 대화 목록에서 이 경계가 놓이는 위치
+    dropped_messages: list[ChatMessage] = field(default_factory=list)  # 이번에 사라진 것만
+    preserved_messages: list[ChatMessage] = field(default_factory=list)
+
+    @property
+    def dropped_tokens(self) -> int:
+        """이번 압축으로 줄어든 양. cumulative 는 세션 누적이라 한 건의 값이 아니다."""
+        return max(0, self.pre_tokens - self.post_tokens)
 
 
 @dataclass
@@ -136,5 +171,6 @@ class Snapshot:
     messages: list[ChatMessage] = field(default_factory=list)
     sessions: list[SessionSummary] = field(default_factory=list)
     hook_blocks: list[HookBlock] = field(default_factory=list)
+    compactions: list[Compaction] = field(default_factory=list)
     context: ContextUsage | None = None
     generated_at: float = 0.0

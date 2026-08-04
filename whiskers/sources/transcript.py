@@ -16,6 +16,10 @@
   최종 상태·보고문이 있다.
 - 서브에이전트 자신의 내부 턴은 이 파일에 기록되지 않는다(`isSidechain`
   레코드 0건 확인) — 위 두 지점(tool_use, 완료 신호)만 보면 충분하다.
+- 컨텍스트 압축은 `type:"system", subtype:"compact_boundary"` 레코드로 남고,
+  `compactMetadata` 안에 버린 양과 **원문으로 남긴 메시지 uuid 목록**이 들어 있다.
+  요약 전문은 그 **바로 다음 줄**의 `isCompactSummary` 레코드에 담긴다 — 이 레코드는
+  `type:"user"` 이므로 걸러내지 않으면 사용자 발화로 오인된다(실제로 그랬다).
 """
 
 from __future__ import annotations
@@ -25,7 +29,14 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from whiskers.state import AgentEvent, AgentStatus, ChatMessage, ContextUsage, HookBlock
+from whiskers.state import (
+    AgentEvent,
+    AgentStatus,
+    ChatMessage,
+    Compaction,
+    ContextUsage,
+    HookBlock,
+)
 
 # 훅 차단은 tool_result 의 에러 문자열로 온다:
 #   "Error: PreToolUse:Agent hook error: [node ".../delegation-gate.js"]: [delegation-gate] 위임 ..."
@@ -86,12 +97,20 @@ class TranscriptTailer:
         self._messages: list[ChatMessage] = []
         self._context: ContextUsage | None = None
         self._hook_blocks: list[HookBlock] = []
+        self._compactions: list[Compaction] = []
         self._touched_dirs: dict[str, int] = {}  # 디렉토리 -> 마지막으로 건드린 순번
         self._touch_seq = 0
 
-    def recent_messages(self, limit: int = MAX_MESSAGES) -> list[ChatMessage]:
-        """세션 시작부터의 대화 전체 (상한에 걸리면 앞부분이 잘린다)."""
-        return self._messages[-limit:]
+    def recent_messages(self) -> list[ChatMessage]:
+        """세션 시작부터의 대화 전체 (MAX_MESSAGES 상한에 걸리면 앞부분이 잘린다).
+
+        여기서 임의로 자르지 않는다 — 압축 경계 위치(`Compaction.message_index`)가
+        이 목록의 인덱스를 가리키므로, 잘라내면 경계가 엉뚱한 자리에 그려진다.
+        """
+        return list(self._messages)
+
+    def compactions(self) -> list[Compaction]:
+        return list(self._compactions)
 
     def hook_blocks(self) -> list[HookBlock]:
         return list(self._hook_blocks)
@@ -143,6 +162,12 @@ class TranscriptTailer:
         if record.get("isSidechain"):
             return  # 서브에이전트 자신의 내부 턴 — 메인 세션 대화 로그가 아님
 
+        # 압축 요약은 type:"user" 로 들어오므로 대화 처리 **앞에서** 가로채야 한다.
+        # 안 그러면 사용자가 요약문을 직접 입력한 것처럼 보인다.
+        if record.get("isCompactSummary"):
+            self._ingest_compaction_summary(record)
+            return
+
         record_type = record.get("type")
         if record_type == "assistant":
             self._ingest_tool_use(record)
@@ -153,6 +178,8 @@ class TranscriptTailer:
             self._ingest_user_text(record)
         elif record_type == "queue-operation":
             self._ingest_task_notification(record)
+        elif record_type == "system":
+            self._ingest_compact_boundary(record)
 
     def _note_touched_path(self, tool_input: dict) -> None:
         """Edit/Write 등이 다룬 파일의 상위 디렉토리를 세어둔다 (프로젝트 루트 추정용)."""
@@ -256,6 +283,47 @@ class TranscriptTailer:
             limit=_context_limit(model, input_tokens),
         )
 
+    def _ingest_compact_boundary(self, record: dict) -> None:
+        """압축 경계 — 지금까지의 대화를 '요약으로 대체됨' / '원문 유지'로 가른다.
+
+        보존 판정은 추정이 아니라 `preservedMessages.uuids` 기록을 그대로 쓴다.
+        같은 필드의 `allUuids` 는 쓰지 않는다 — `uuids` 를 넘는 초과분 74건이 전수
+        transcript 에 없는 uuid 여서(실측) 대화 판정에는 보탬이 되지 않는다.
+        """
+        if record.get("subtype") != "compact_boundary":
+            return  # 훅 결과 등 다른 system 레코드
+
+        metadata = record.get("compactMetadata") or {}
+        preserved_uuids = set((metadata.get("preservedMessages") or {}).get("uuids") or [])
+        compaction = Compaction(
+            trigger=metadata.get("trigger") or "?",
+            timestamp=_parse_timestamp(record.get("timestamp")),
+            pre_tokens=int(metadata.get("preTokens") or 0),
+            post_tokens=int(metadata.get("postTokens") or 0),
+            duration_ms=int(metadata.get("durationMs") or 0),
+            cumulative_dropped_tokens=metadata.get("cumulativeDroppedTokens"),
+            message_index=len(self._messages),
+        )
+
+        for message in self._messages:
+            preserved = bool(message.uuid) and message.uuid in preserved_uuids
+            if preserved:
+                compaction.preserved_messages.append(message)
+            elif not message.dropped:
+                # 이미 앞선 압축에서 사라진 건 다시 세지 않는다 — 이번에 잃은 것만 담는다
+                compaction.dropped_messages.append(message)
+            message.dropped = not preserved
+            message.survived_compaction = preserved
+
+        self._compactions.append(compaction)
+
+    def _ingest_compaction_summary(self, record: dict) -> None:
+        """버려진 대화를 대신하는 요약 전문. 경계 레코드 바로 다음 줄에 온다."""
+        content = (record.get("message") or {}).get("content")
+        text = content.strip() if isinstance(content, str) else ""
+        if text and self._compactions:
+            self._compactions[-1].summary = text
+
     def _ingest_assistant_text(self, record: dict) -> None:
         content = (record.get("message") or {}).get("content") or []
         timestamp = _parse_timestamp(record.get("timestamp"))
@@ -263,17 +331,18 @@ class TranscriptTailer:
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "").strip()
                 if text:
-                    self._append_message("assistant", text, timestamp)
+                    self._append_message("assistant", text, timestamp, record.get("uuid") or "")
 
     def _ingest_user_text(self, record: dict) -> None:
         content = (record.get("message") or {}).get("content")
         timestamp = _parse_timestamp(record.get("timestamp"))
+        uuid = record.get("uuid") or ""
 
         if isinstance(content, str):
             # 실제 타이핑된 프롬프트는 평문. system-reminder/task-notification 같은
             # 내부 주입 텍스트는 "<태그>"로 시작하는 관용구라 여기서 걸러낸다.
             if content.strip() and not content.lstrip().startswith("<"):
-                self._append_message("user", content.strip(), timestamp)
+                self._append_message("user", content.strip(), timestamp, uuid)
             return
 
         if not isinstance(content, list):
@@ -284,12 +353,19 @@ class TranscriptTailer:
         texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
         joined = "\n".join(t for t in texts if t).strip()
         if joined:
-            self._append_message("user", joined, timestamp)
+            self._append_message("user", joined, timestamp, uuid)
 
-    def _append_message(self, role: str, text: str, timestamp: float) -> None:
-        self._messages.append(ChatMessage(role=role, text=text, timestamp=timestamp))
+    def _append_message(self, role: str, text: str, timestamp: float, uuid: str = "") -> None:
+        self._messages.append(
+            ChatMessage(role=role, text=text, timestamp=timestamp, uuid=uuid)
+        )
         if len(self._messages) > MAX_MESSAGES:
-            self._messages = self._messages[-MAX_MESSAGES:]
+            removed = len(self._messages) - MAX_MESSAGES
+            self._messages = self._messages[removed:]
+            # 앞부분이 잘리면 압축 경계 위치도 같이 당겨야 한다 — 안 그러면 경계가
+            # 엉뚱한 대화 사이에 그려진다
+            for compaction in self._compactions:
+                compaction.message_index = max(0, compaction.message_index - removed)
 
     def _ingest_task_notification(self, record: dict) -> None:
         content = record.get("content")
