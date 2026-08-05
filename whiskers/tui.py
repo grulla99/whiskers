@@ -1382,9 +1382,10 @@ class ClaudeMonitorApp(App):
         padding: 0 1;
         background: transparent;
     }
-    ListView > ListItem.--highlight {
-        background: $primary 25%;
-    }
+    /* 키보드 선택 표시는 일부러 두지 않는다. Textual 이 붙이는 클래스는 `-highlight`
+       (대시 1개)라 예전 `.--highlight` 규칙은 매칭조차 안 되던 죽은 코드였고, 되살리면
+       클릭한 항목의 배경이 계속 남아 "호버가 안 풀린다"처럼 보인다. 이 패널은 읽기
+       전용이라 선택 자체에 의미가 없어, 상태 표시는 호버와 클릭 플래시로만 한다. */
     /* 2줄 이상인 카드는 아래 여백을 줘야 서로 붙어 보이지 않는다.
        왼쪽 1칸은 호버 시 나타나는 강조 띠 자리 — 평상시엔 투명해서 글자가 밀리지 않는다. */
     #chat-list > MessageListItem,
